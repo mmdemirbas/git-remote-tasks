@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# tasks-init — initialize a git repo for task sync with git-remote-tasks.
+#
+# Usage:
+#   tasks-init [--format yaml|org] [--dir PATH]
+#   tasks-init --help
+#
+# What it does:
+#   1. Creates the target directory (or uses cwd) and runs `git init`.
+#   2. Prompts for the file format if --format was not given (yaml or org).
+#   3. Writes `[tasks] format = <choice>` via `git config --local`.
+#   4. Creates a minimal .gitignore.
+#   5. Creates tasks/ with a .gitkeep.
+#   6. Makes an empty initial commit "tasks: init (<format> format)".
+#   7. Prints next steps (how to add a remote, how to fetch).
+
+set -euo pipefail
+
+FORMAT=""
+DIR=""
+
+usage() {
+  sed -n '1,16p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --format)
+      FORMAT="${2:-}"
+      shift 2
+      ;;
+    --dir)
+      DIR="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "tasks-init: unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -n "$DIR" ]]; then
+  mkdir -p "$DIR"
+  cd "$DIR"
+fi
+
+if [[ -z "$FORMAT" ]]; then
+  while true; do
+    read -rp "Choose task file format [yaml/org]: " FORMAT
+    case "$FORMAT" in
+      yaml|org) break ;;
+      *) echo "  → please enter 'yaml' or 'org'." ;;
+    esac
+  done
+fi
+
+case "$FORMAT" in
+  yaml|org) ;;
+  *)
+    echo "tasks-init: --format must be 'yaml' or 'org' (got: $FORMAT)" >&2
+    exit 2
+    ;;
+esac
+
+if [[ ! -d .git ]]; then
+  git init --quiet
+fi
+
+git config --local tasks.format "$FORMAT"
+
+if [[ ! -f .gitignore ]]; then
+  cat > .gitignore <<'EOF'
+# git-remote-tasks: nothing task-specific is ignored by default.
+EOF
+fi
+
+mkdir -p tasks
+touch tasks/.gitkeep
+
+git add .gitignore tasks/.gitkeep
+# Guard against nothing-to-commit when re-running.
+if ! git diff --cached --quiet; then
+  git commit --quiet -m "tasks: init ($FORMAT format)"
+fi
+
+cat <<EOF
+
+Repo initialized with task format: $FORMAT
+
+Next steps:
+  1. Install helper symlinks (once per machine):
+       python git_remote_tasks.py install --bin-dir ~/.local/bin
+
+  2. Configure one or more remotes. Example for Vikunja:
+       git remote add vikunja vikunja://localhost:3456
+       git config tasks-remote.vikunja.scheme    vikunja
+       git config tasks-remote.vikunja.baseUrl   http://localhost:3456
+       git config tasks-remote.vikunja.apiToken  YOUR_TOKEN
+
+  3. Pull tasks:
+       git fetch vikunja
+       git merge vikunja/main --allow-unrelated-histories
+       ls tasks/
+
+  4. Push edits:
+       \$EDITOR tasks/vikunja-42.$FORMAT
+       git add tasks/
+       git commit -m "tasks: tweak priority"
+       git push vikunja main
+EOF

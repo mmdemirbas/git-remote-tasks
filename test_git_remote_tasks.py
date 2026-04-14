@@ -1,0 +1,1422 @@
+"""Tests for git_remote_tasks.
+
+Run with:
+    python -m unittest -v test_git_remote_tasks
+
+Coverage:
+    python -m coverage run -m unittest test_git_remote_tasks
+    python -m coverage report -m --include=git_remote_tasks.py
+"""
+
+from __future__ import annotations
+
+import io
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import git_remote_tasks as grt
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def full_task(**overrides) -> dict:
+    t = grt.empty_task()
+    t.update({
+        "id": "jira-PROJ-123",
+        "source": "jira",
+        "title": "Fix authentication timeout on mobile login",
+        "description": "Users get logged out.\nAffects iOS only.",
+        "status": "in_progress",
+        "priority": "high",
+        "created_date": "2024-11-03T09:15:00Z",
+        "due_date": "2025-04-20",
+        "updated_date": "2025-04-12T14:30:00Z",
+        "tags": ["mobile", "ios", "auth"],
+        "category": {"id": "PROJ", "name": "Backend", "type": "project"},
+        "url": "https://company.atlassian.net/browse/PROJ-123",
+    })
+    t.update(overrides)
+    return t
+
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+class TestSchema(unittest.TestCase):
+    def test_empty_task_has_all_fields(self):
+        t = grt.empty_task()
+        for field in grt.TASK_FIELDS:
+            self.assertIn(field, t)
+        self.assertEqual(t["tags"], [])
+        self.assertEqual(t["category"]["type"], "other")
+
+    def test_normalize_fills_missing(self):
+        t = grt.normalize_task({"id": "x", "category": {"name": "N"}})
+        self.assertEqual(t["id"], "x")
+        self.assertEqual(t["category"], {"id": None, "name": "N", "type": "other"})
+        self.assertEqual(t["status"], "todo")
+
+    def test_normalize_preserves_logbook(self):
+        t = grt.normalize_task({"id": "x", "logbook": ["entry"]})
+        self.assertEqual(t["logbook"], ["entry"])
+
+    def test_normalize_none_category_type_defaults(self):
+        t = grt.normalize_task({"category": {"type": None}})
+        self.assertEqual(t["category"]["type"], "other")
+
+
+# ---------------------------------------------------------------------------
+# YAML serializer
+# ---------------------------------------------------------------------------
+
+class TestYAMLSerializer(unittest.TestCase):
+    def setUp(self):
+        self.s = grt.YAMLSerializer()
+
+    def test_roundtrip_identical(self):
+        t = full_task()
+        a = self.s.serialize(t)
+        b = self.s.serialize(self.s.deserialize(a))
+        self.assertEqual(a, b)
+
+    def test_all_fields_roundtrip_to_dict(self):
+        t = full_task()
+        back = self.s.deserialize(self.s.serialize(t))
+        self.assertEqual(back, t)
+
+    def test_null_fields_roundtrip(self):
+        t = full_task(description=None, due_date=None, url=None)
+        back = self.s.deserialize(self.s.serialize(t))
+        self.assertIsNone(back["description"])
+        self.assertIsNone(back["due_date"])
+        self.assertIsNone(back["url"])
+
+    def test_empty_tags_list(self):
+        t = full_task(tags=[])
+        text = self.s.serialize(t)
+        self.assertIn("tags: []", text)
+        self.assertEqual(self.s.deserialize(text)["tags"], [])
+
+    def test_multiline_description_block_scalar(self):
+        t = full_task(description="a\nb\nc")
+        text = self.s.serialize(t)
+        self.assertIn("description: |", text)
+        back = self.s.deserialize(text)
+        self.assertEqual(back["description"], "a\nb\nc")
+
+    def test_unicode_fields(self):
+        t = full_task(title="üñîçödé 🌟", description="Zürich café ☕")
+        back = self.s.deserialize(self.s.serialize(t))
+        self.assertEqual(back["title"], "üñîçödé 🌟")
+        self.assertEqual(back["description"], "Zürich café ☕")
+
+    def test_dates_always_quoted(self):
+        t = full_task()
+        text = self.s.serialize(t)
+        self.assertIn('created_date: "2024-11-03T09:15:00Z"', text)
+        self.assertIn('due_date: "2025-04-20"', text)
+        self.assertIn('updated_date: "2025-04-12T14:30:00Z"', text)
+
+    def test_missing_optional_fields_yield_none(self):
+        text = (
+            "id: x\n"
+            "source: src\n"
+            "title: hi\n"
+            "status: todo\n"
+            "priority: none\n"
+            "tags: []\n"
+            "category:\n"
+            "  id: null\n"
+            "  name: null\n"
+            "  type: other\n"
+        )
+        back = self.s.deserialize(text)
+        self.assertIsNone(back["description"])
+        self.assertIsNone(back["due_date"])
+        self.assertIsNone(back["url"])
+
+    def test_quoted_value_with_escape(self):
+        t = full_task(title='has "quotes" and \\slash')
+        back = self.s.deserialize(self.s.serialize(t))
+        self.assertEqual(back["title"], 'has "quotes" and \\slash')
+
+    def test_comment_lines_ignored(self):
+        text = "id: x\n# a comment\nsource: s\ntitle: hi\n"
+        back = self.s.deserialize(text)
+        self.assertEqual(back["id"], "x")
+        self.assertEqual(back["source"], "s")
+
+    def test_logbook_preserved_when_present(self):
+        t = full_task()
+        t["logbook"] = ['- State "DONE" from "TODO" [2025-04-10 Thu 11:00]']
+        out = self.s.serialize(t)
+        self.assertIn("logbook:", out)
+        back = self.s.deserialize(out)
+        self.assertEqual(back["logbook"], t["logbook"])
+
+    def test_reserved_word_title_quoted(self):
+        t = full_task(title="null")
+        text = self.s.serialize(t)
+        self.assertIn('title: "null"', text)
+        self.assertEqual(self.s.deserialize(text)["title"], "null")
+
+
+# ---------------------------------------------------------------------------
+# Org serializer
+# ---------------------------------------------------------------------------
+
+class TestOrgSerializer(unittest.TestCase):
+    def setUp(self):
+        self.s = grt.OrgSerializer()
+
+    def test_roundtrip_stable(self):
+        t = full_task()
+        a = self.s.serialize(t)
+        b = self.s.serialize(self.s.deserialize(a))
+        self.assertEqual(a, b)
+
+    def test_all_statuses_roundtrip(self):
+        for status in grt.STATUSES:
+            t = full_task(status=status)
+            back = self.s.deserialize(self.s.serialize(t))
+            self.assertEqual(back["status"], status)
+
+    def test_all_priorities_roundtrip(self):
+        for pri in grt.PRIORITIES:
+            t = full_task(priority=pri)
+            back = self.s.deserialize(self.s.serialize(t))
+            self.assertEqual(back["priority"], pri)
+
+    def test_absent_priority_is_none(self):
+        text = (
+            "* TODO Hello\n"
+            "  :PROPERTIES:\n"
+            "  :ID: x\n"
+            "  :SOURCE: s\n"
+            "  :END:\n"
+        )
+        t = self.s.deserialize(text)
+        self.assertEqual(t["priority"], "none")
+
+    def test_multiline_description_preserved(self):
+        t = full_task(description="line1\nline2\nline3")
+        back = self.s.deserialize(self.s.serialize(t))
+        self.assertEqual(back["description"], "line1\nline2\nline3")
+
+    def test_tags_roundtrip_via_comma_separated(self):
+        t = full_task(tags=["a", "b", "c"])
+        text = self.s.serialize(t)
+        self.assertIn(":TAGS: a,b,c", text)
+        self.assertEqual(self.s.deserialize(text)["tags"], ["a", "b", "c"])
+
+    def test_unicode_fields(self):
+        t = full_task(title="Zürich 🌟", description="café ☕")
+        back = self.s.deserialize(self.s.serialize(t))
+        self.assertEqual(back["title"], "Zürich 🌟")
+        self.assertEqual(back["description"], "café ☕")
+
+    def test_logbook_preserved(self):
+        src = (
+            "* DONE [#A] Title\n"
+            "  :PROPERTIES:\n"
+            "  :ID: x\n"
+            "  :SOURCE: s\n"
+            "  :END:\n"
+            "  :LOGBOOK:\n"
+            '  - State "DONE" from "TODO" [2025-04-10 Thu 11:00]\n'
+            "  :END:\n"
+            "\n"
+            "  description body\n"
+        )
+        t = self.s.deserialize(src)
+        self.assertTrue(t.get("logbook"))
+        out = self.s.serialize(t)
+        self.assertIn(":LOGBOOK:", out)
+        self.assertIn('State "DONE" from "TODO"', out)
+
+    def test_missing_properties_drawer_handled(self):
+        src = "* TODO Hello\n"
+        t = self.s.deserialize(src)
+        self.assertEqual(t["title"], "Hello")
+        self.assertEqual(t["status"], "todo")
+
+    def test_no_headline_returns_empty(self):
+        t = self.s.deserialize("no headline here\n")
+        self.assertEqual(t["title"], "")
+
+    def test_org_timestamp_iso_conversion_bad_input(self):
+        self.assertEqual(grt._org_timestamp_to_iso("garbage"), "garbage")
+
+    def test_iso_to_org_timestamp_bad_input_passthrough(self):
+        self.assertIn("not-a-date", grt._iso_to_org_timestamp("not-a-date"))
+
+
+# ---------------------------------------------------------------------------
+# Symmetry
+# ---------------------------------------------------------------------------
+
+class TestSerializerSymmetry(unittest.TestCase):
+    def test_both_produce_different_text_same_dict(self):
+        y = grt.YAMLSerializer()
+        o = grt.OrgSerializer()
+        t = full_task()
+        ytext = y.serialize(t)
+        otext = o.serialize(t)
+        self.assertNotEqual(ytext, otext)
+        self.assertEqual(y.deserialize(ytext), t)
+        self.assertEqual(o.deserialize(otext), t)
+
+
+# ---------------------------------------------------------------------------
+# Format detection
+# ---------------------------------------------------------------------------
+
+class TestFormatDetection(unittest.TestCase):
+    def test_yaml_extension(self):
+        self.assertIsInstance(grt.serializer_for_extension("tasks/x.yaml"),
+                              grt.YAMLSerializer)
+
+    def test_yml_extension(self):
+        self.assertIsInstance(grt.serializer_for_extension("tasks/x.yml"),
+                              grt.YAMLSerializer)
+
+    def test_org_extension(self):
+        self.assertIsInstance(grt.serializer_for_extension("tasks/x.org"),
+                              grt.OrgSerializer)
+
+    def test_unknown_extension_raises(self):
+        with self.assertRaises(ValueError):
+            grt.serializer_for_extension("tasks/x.json")
+
+    def test_serializer_for_format_yaml(self):
+        self.assertIsInstance(grt.serializer_for_format("yaml"), grt.YAMLSerializer)
+
+    def test_serializer_for_format_org(self):
+        self.assertIsInstance(grt.serializer_for_format("org"), grt.OrgSerializer)
+
+    def test_serializer_for_format_unknown(self):
+        with self.assertRaises(ValueError):
+            grt.serializer_for_format("json")
+
+
+# ---------------------------------------------------------------------------
+# Config reader
+# ---------------------------------------------------------------------------
+
+class TestConfigReader(unittest.TestCase):
+    def test_read_value_success(self):
+        with mock.patch.object(subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="the-value\n", stderr="")
+            self.assertEqual(grt.read_config_value("foo.bar"), "the-value")
+
+    def test_read_value_missing_returns_none(self):
+        with mock.patch.object(subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=1, stdout="", stderr="")
+            self.assertIsNone(grt.read_config_value("foo.bar"))
+
+    def test_read_value_subprocess_error(self):
+        with mock.patch.object(subprocess, "run", side_effect=FileNotFoundError("git?")):
+            self.assertIsNone(grt.read_config_value("x"))
+
+    def test_read_value_stderr_logged(self):
+        with mock.patch.object(subprocess, "run") as run, \
+                mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+            run.return_value = mock.Mock(returncode=1, stdout="", stderr="boom")
+            grt.read_config_value("x")
+        self.assertIn("boom", err.getvalue())
+
+    def test_read_format_default_yaml(self):
+        with mock.patch.object(grt, "read_config_value", return_value=None):
+            self.assertEqual(grt.read_format(), "yaml")
+
+    def test_read_format_org(self):
+        with mock.patch.object(grt, "read_config_value", return_value="org"):
+            self.assertEqual(grt.read_format(), "org")
+
+    def test_read_format_invalid_falls_back(self):
+        with mock.patch.object(grt, "read_config_value", return_value="xml"):
+            self.assertEqual(grt.read_format(), "yaml")
+
+    def test_read_remote_config_parses_output(self):
+        output = (
+            "tasks-remote.jira-work.scheme jira\n"
+            "tasks-remote.jira-work.baseUrl https://example.com\n"
+            "tasks-remote.jira-work.email me@x.com\n"
+        )
+        with mock.patch.object(grt, "_run_git_config", return_value=output):
+            cfg = grt.read_remote_config("jira-work")
+        self.assertEqual(cfg["scheme"], "jira")
+        self.assertEqual(cfg["baseUrl"], "https://example.com")
+        self.assertEqual(cfg["email"], "me@x.com")
+
+    def test_read_remote_config_empty(self):
+        with mock.patch.object(grt, "_run_git_config", return_value=None):
+            self.assertEqual(grt.read_remote_config("missing"), {})
+
+
+# ---------------------------------------------------------------------------
+# Driver normalization - Jira
+# ---------------------------------------------------------------------------
+
+class TestJiraDriver(unittest.TestCase):
+    def setUp(self):
+        self.d = grt.JiraDriver("jira", "https://x/y",
+                                {"baseUrl": "https://x/y", "email": "a@b.c",
+                                 "apiToken": "tok"})
+
+    def _issue(self, **field_overrides) -> dict:
+        fields = {
+            "summary": "Hello",
+            "description": None,
+            "status": {"name": "To Do"},
+            "priority": {"name": "High"},
+            "created": "2025-01-01T00:00:00.000+0000",
+            "updated": "2025-02-01T00:00:00.000+0000",
+            "duedate": "2025-03-01",
+            "labels": ["a", "b"],
+            "project": {"key": "PROJ", "name": "Project X"},
+        }
+        fields.update(field_overrides)
+        return {"key": "PROJ-1", "fields": fields}
+
+    def test_status_in_progress(self):
+        t = self.d.normalize(self._issue(status={"name": "In Progress"}))
+        self.assertEqual(t["status"], "in_progress")
+
+    def test_status_done(self):
+        t = self.d.normalize(self._issue(status={"name": "Done"}))
+        self.assertEqual(t["status"], "done")
+
+    def test_status_todo(self):
+        t = self.d.normalize(self._issue(status={"name": "To Do"}))
+        self.assertEqual(t["status"], "todo")
+
+    def test_status_cancelled_variants(self):
+        for name in ("Won't Do", "Cancelled", "Canceled"):
+            t = self.d.normalize(self._issue(status={"name": name}))
+            self.assertEqual(t["status"], "cancelled", f"for {name!r}")
+
+    def test_status_unknown_safe_default(self):
+        t = self.d.normalize(self._issue(status={"name": "Bizarre"}))
+        self.assertEqual(t["status"], "todo")
+
+    def test_priority_highest_to_critical(self):
+        for name in ("Highest", "Critical", "Blocker"):
+            t = self.d.normalize(self._issue(priority={"name": name}))
+            self.assertEqual(t["priority"], "critical", name)
+
+    def test_priority_high(self):
+        t = self.d.normalize(self._issue(priority={"name": "High"}))
+        self.assertEqual(t["priority"], "high")
+
+    def test_priority_all_levels(self):
+        expected = {"Medium": "medium", "Low": "low", "Lowest": "low"}
+        for name, unified in expected.items():
+            t = self.d.normalize(self._issue(priority={"name": name}))
+            self.assertEqual(t["priority"], unified)
+
+    def test_priority_missing(self):
+        t = self.d.normalize(self._issue(priority=None))
+        self.assertEqual(t["priority"], "none")
+
+    def test_description_missing(self):
+        t = self.d.normalize(self._issue(description=None))
+        self.assertIsNone(t["description"])
+
+    def test_description_adf(self):
+        adf = {"type": "doc", "content": [
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "Hello "},
+                {"type": "text", "text": "world"},
+            ]}
+        ]}
+        t = self.d.normalize(self._issue(description=adf))
+        self.assertEqual(t["description"], "Hello world")
+
+    def test_description_adf_none(self):
+        self.assertIsNone(grt._jira_extract_adf_text(None))
+        self.assertIsNone(grt._jira_extract_adf_text(123))
+
+    def test_labels_map_to_tags(self):
+        t = self.d.normalize(self._issue(labels=["x", "y"]))
+        self.assertEqual(t["tags"], ["x", "y"])
+
+    def test_epic_category(self):
+        t = self.d.normalize(self._issue(customfield_10014="EPIC-1"))
+        self.assertEqual(t["category"]["type"], "epic")
+
+    def test_project_category(self):
+        t = self.d.normalize(self._issue())
+        self.assertEqual(t["category"]["type"], "project")
+        self.assertEqual(t["category"]["id"], "PROJ")
+
+    def test_url_constructed(self):
+        t = self.d.normalize(self._issue())
+        self.assertEqual(t["url"], "https://x/y/browse/PROJ-1")
+
+    def test_fetch_all_paginates(self):
+        calls = []
+        def fake_get(url, headers=None):
+            calls.append(url)
+            if "startAt=0" in url:
+                return {"issues": [self._issue()], "total": 2}
+            return {"issues": [self._issue()], "total": 2}
+        with mock.patch.object(self.d, "_http_get", side_effect=fake_get):
+            tasks = self.d.fetch_all()
+        self.assertEqual(len(tasks), 2)
+        self.assertEqual(len(calls), 2)
+
+    def test_fetch_all_no_base_url(self):
+        d = grt.JiraDriver("jira", "", {})
+        with self.assertRaises(NotImplementedError):
+            d.fetch_all()
+
+    def test_upsert_not_implemented(self):
+        with self.assertRaises(NotImplementedError):
+            self.d.upsert({})
+
+    def test_delete_not_implemented(self):
+        with self.assertRaises(NotImplementedError):
+            self.d.delete("jira-PROJ-1")
+
+
+# ---------------------------------------------------------------------------
+# Driver normalization - Vikunja
+# ---------------------------------------------------------------------------
+
+class TestVikunjaDriver(unittest.TestCase):
+    def setUp(self):
+        self.d = grt.VikunjaDriver("vikunja", "http://localhost:3456",
+                                   {"baseUrl": "http://localhost:3456",
+                                    "apiToken": "tok"})
+
+    def test_priority_map(self):
+        expected = {1: "critical", 2: "high", 3: "medium", 4: "low", 5: "none"}
+        for p, u in expected.items():
+            t = self.d.normalize({"id": 1, "title": "x", "priority": p})
+            self.assertEqual(t["priority"], u)
+
+    def test_done_true_to_done(self):
+        t = self.d.normalize({"id": 1, "title": "x", "done": True})
+        self.assertEqual(t["status"], "done")
+
+    def test_done_false_to_todo(self):
+        t = self.d.normalize({"id": 1, "title": "x", "done": False})
+        self.assertEqual(t["status"], "todo")
+
+    def test_date_mapping(self):
+        t = self.d.normalize({
+            "id": 1, "title": "x", "due_date": "2025-01-01T00:00:00Z",
+        })
+        self.assertEqual(t["due_date"], "2025-01-01T00:00:00Z")
+
+    def test_end_date_fallback(self):
+        t = self.d.normalize({"id": 1, "title": "x", "end_date": "2025-02-02"})
+        self.assertEqual(t["due_date"], "2025-02-02")
+
+    def test_labels_to_tags(self):
+        t = self.d.normalize({
+            "id": 1, "title": "x",
+            "labels": [{"title": "l1"}, {"title": "l2"}]
+        })
+        self.assertEqual(t["tags"], ["l1", "l2"])
+
+    def test_project_category(self):
+        t = self.d.normalize({
+            "id": 7, "title": "x", "project_id": 99,
+            "project": {"id": 99, "title": "Inbox"},
+        })
+        self.assertEqual(t["category"]["name"], "Inbox")
+        self.assertEqual(t["category"]["type"], "project")
+
+    def test_fetch_all_paginates(self):
+        page1 = [{"id": i, "title": f"t{i}"} for i in range(50)]
+        page2 = [{"id": 99, "title": "last"}]
+        seq = [page1, page2]
+        with mock.patch.object(self.d, "_http_get", side_effect=seq):
+            tasks = self.d.fetch_all()
+        self.assertEqual(len(tasks), 51)
+
+    def test_fetch_all_no_base_url_raises(self):
+        d = grt.VikunjaDriver("v", "", {})
+        with self.assertRaises(NotImplementedError):
+            d.fetch_all()
+
+    def test_fetch_all_dict_response(self):
+        with mock.patch.object(self.d, "_http_get", return_value={"tasks": []}):
+            self.assertEqual(self.d.fetch_all(), [])
+
+    def test_upsert_not_implemented(self):
+        with self.assertRaises(NotImplementedError):
+            self.d.upsert({})
+
+    def test_delete_not_implemented(self):
+        with self.assertRaises(NotImplementedError):
+            self.d.delete("vikunja-1")
+
+
+# ---------------------------------------------------------------------------
+# Driver normalization - MSTodo
+# ---------------------------------------------------------------------------
+
+class TestMSTodoDriver(unittest.TestCase):
+    def setUp(self):
+        self.d = grt.MSTodoDriver("msftodo", "msftodo://consumers",
+                                  {"accessToken": "tok"})
+
+    def test_importance_mapping(self):
+        for imp, unified in (("high", "high"), ("normal", "medium"), ("low", "low")):
+            t = self.d.normalize({"id": "1", "title": "x", "importance": imp})
+            self.assertEqual(t["priority"], unified)
+
+    def test_status_mapping(self):
+        cases = {"completed": "done", "notStarted": "todo", "inProgress": "in_progress"}
+        for s, u in cases.items():
+            t = self.d.normalize({"id": "1", "title": "x", "status": s})
+            self.assertEqual(t["status"], u)
+
+    def test_list_name_category(self):
+        t = self.d.normalize({"id": "1", "title": "x"}, list_name="Groceries")
+        self.assertEqual(t["category"]["name"], "Groceries")
+        self.assertEqual(t["category"]["type"], "list")
+
+    def test_reminder_datetime_tolerated(self):
+        t = self.d.normalize({
+            "id": "1", "title": "x",
+            "reminderDateTime": {"dateTime": "2025-01-01", "timeZone": "UTC"},
+        })
+        self.assertEqual(t["title"], "x")
+
+    def test_due_date_nested(self):
+        t = self.d.normalize({
+            "id": "1", "title": "x",
+            "dueDateTime": {"dateTime": "2025-01-01T00:00:00", "timeZone": "UTC"},
+        })
+        self.assertEqual(t["due_date"], "2025-01-01T00:00:00")
+
+    def test_due_date_string(self):
+        t = self.d.normalize({"id": "1", "title": "x", "dueDateTime": "2025-01-01"})
+        self.assertEqual(t["due_date"], "2025-01-01")
+
+    def test_body_description(self):
+        t = self.d.normalize({"id": "1", "title": "x",
+                               "body": {"content": "body text"}})
+        self.assertEqual(t["description"], "body text")
+
+    def test_linked_resources_url(self):
+        t = self.d.normalize({
+            "id": "1", "title": "x",
+            "linkedResources": [{"webUrl": "https://example.com"}],
+        })
+        self.assertEqual(t["url"], "https://example.com")
+
+    def test_fetch_all_happy_path(self):
+        responses = [
+            {"value": [{"id": "L1", "displayName": "Inbox"}]},
+            {"value": [{"id": "T1", "title": "one"}]},
+        ]
+        with mock.patch.object(self.d, "_http_get", side_effect=responses):
+            tasks = self.d.fetch_all()
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["category"]["name"], "Inbox")
+
+    def test_fetch_all_requires_auth(self):
+        d = grt.MSTodoDriver("msftodo", "msftodo://consumers", {})
+        with mock.patch.object(grt, "MSAL_AVAILABLE", False):
+            with self.assertRaises(NotImplementedError):
+                d.fetch_all()
+
+
+# ---------------------------------------------------------------------------
+# Driver normalization - Notion
+# ---------------------------------------------------------------------------
+
+class TestNotionDriver(unittest.TestCase):
+    def setUp(self):
+        self.d = grt.NotionDriver("notion", "notion://abc",
+                                  {"databaseId": "abc", "token": "tok"})
+
+    def _page(self, **props) -> dict:
+        return {
+            "id": "page-1",
+            "created_time": "2025-01-01T00:00:00Z",
+            "last_edited_time": "2025-02-01T00:00:00Z",
+            "url": "https://www.notion.so/page-1",
+            "properties": props,
+        }
+
+    def test_title_from_rich_text(self):
+        page = self._page(Name={"type": "title",
+                                "title": [{"plain_text": "Hello "},
+                                          {"plain_text": "world"}]})
+        t = self.d.normalize(page)
+        self.assertEqual(t["title"], "Hello world")
+
+    def test_select_maps_status(self):
+        page = self._page(
+            Name={"type": "title", "title": [{"plain_text": "t"}]},
+            Status={"type": "select", "select": {"name": "In Progress"}},
+        )
+        self.assertEqual(self.d.normalize(page)["status"], "in_progress")
+
+    def test_select_maps_priority(self):
+        page = self._page(
+            Name={"type": "title", "title": [{"plain_text": "t"}]},
+            Priority={"type": "select", "select": {"name": "High"}},
+        )
+        self.assertEqual(self.d.normalize(page)["priority"], "high")
+
+    def test_multi_select_tags(self):
+        page = self._page(
+            Name={"type": "title", "title": [{"plain_text": "t"}]},
+            Tags={"type": "multi_select",
+                  "multi_select": [{"name": "a"}, {"name": "b"}]},
+        )
+        self.assertEqual(self.d.normalize(page)["tags"], ["a", "b"])
+
+    def test_date_property(self):
+        page = self._page(
+            Name={"type": "title", "title": [{"plain_text": "t"}]},
+            Due={"type": "date", "date": {"start": "2025-04-20"}},
+        )
+        self.assertEqual(self.d.normalize(page)["due_date"], "2025-04-20")
+
+    def test_checkbox_done(self):
+        page = self._page(
+            Name={"type": "title", "title": [{"plain_text": "t"}]},
+            Done={"type": "checkbox", "checkbox": True},
+        )
+        self.assertEqual(self.d.normalize(page)["status"], "done")
+
+    def test_null_property_value_safe(self):
+        page = self._page(
+            Name={"type": "title", "title": [{"plain_text": "t"}]},
+            Status={"type": "select", "select": None},
+            Broken=None,
+        )
+        t = self.d.normalize(page)
+        self.assertEqual(t["status"], "todo")
+
+    def test_rich_text_description(self):
+        page = self._page(
+            Name={"type": "title", "title": [{"plain_text": "t"}]},
+            Description={"type": "rich_text",
+                          "rich_text": [{"plain_text": "desc"}]},
+        )
+        self.assertEqual(self.d.normalize(page)["description"], "desc")
+
+    def test_db_title_sets_category(self):
+        page = self._page(Name={"type": "title",
+                                "title": [{"plain_text": "t"}]})
+        t = self.d.normalize(page, db_title="Inbox")
+        self.assertEqual(t["category"], {"id": "abc", "name": "Inbox",
+                                         "type": "database"})
+
+    def test_upsert_raises(self):
+        with self.assertRaises(NotImplementedError):
+            self.d.upsert({})
+
+    def test_delete_raises(self):
+        with self.assertRaises(NotImplementedError):
+            self.d.delete("notion-1")
+
+    def test_fetch_all_paginates(self):
+        responses = [
+            {"results": [{"id": "p1", "properties": {}}],
+             "has_more": True, "next_cursor": "c1"},
+            {"results": [{"id": "p2", "properties": {}}], "has_more": False},
+        ]
+        with mock.patch.object(self.d, "_http_post", side_effect=responses):
+            tasks = self.d.fetch_all()
+        self.assertEqual(len(tasks), 2)
+
+    def test_fetch_all_requires_database_id(self):
+        d = grt.NotionDriver("n", "notion://", {})
+        with self.assertRaises(NotImplementedError):
+            d.fetch_all()
+
+
+# ---------------------------------------------------------------------------
+# Scheme resolution
+# ---------------------------------------------------------------------------
+
+class TestInstallIntegration(unittest.TestCase):
+    def test_scheme_for_name_jira(self):
+        self.assertEqual(grt.scheme_for_name("git-remote-jira"), "jira")
+
+    def test_scheme_for_name_vikunja(self):
+        self.assertEqual(grt.scheme_for_name("/usr/bin/git-remote-vikunja"), "vikunja")
+
+    def test_scheme_for_name_direct_script(self):
+        self.assertIsNone(grt.scheme_for_name("git_remote_tasks.py"))
+
+    def test_scheme_for_name_unknown(self):
+        self.assertIsNone(grt.scheme_for_name("git-remote-xyzzy"))
+
+    def test_driver_for_scheme_returns_instance(self):
+        d = grt.driver_for_scheme("jira", remote_name="r", url="u", config={})
+        self.assertIsInstance(d, grt.JiraDriver)
+
+    def test_driver_for_scheme_unknown_raises(self):
+        with self.assertRaises(ValueError):
+            grt.driver_for_scheme("unknown")
+
+
+# ---------------------------------------------------------------------------
+# Protocol handler
+# ---------------------------------------------------------------------------
+
+class FakeDriver(grt.Driver):
+    SCHEME = "fake"
+
+    def __init__(self, tasks=None):
+        super().__init__("fake", "fake://x", {})
+        self.tasks = tasks or []
+        self.upserted: list[dict] = []
+        self.deleted: list[str] = []
+
+    def fetch_all(self) -> list[dict]:
+        return list(self.tasks)
+
+    def upsert(self, task: dict) -> None:
+        self.upserted.append(task)
+
+    def delete(self, task_id: str) -> None:
+        self.deleted.append(task_id)
+
+
+class FlushTrackingStringIO(io.StringIO):
+    def __init__(self):
+        super().__init__()
+        self.flush_count = 0
+
+    def flush(self):
+        self.flush_count += 1
+        super().flush()
+
+
+def make_handler(driver=None, serializer=None, stdin_text="") -> grt.ProtocolHandler:
+    d = driver or FakeDriver()
+    s = serializer or grt.YAMLSerializer()
+    return grt.ProtocolHandler(
+        "fake", "fake://x", d, s,
+        stdin=io.StringIO(stdin_text),
+        stdout=FlushTrackingStringIO(),
+        stderr=io.StringIO(),
+    )
+
+
+class TestProtocolCapabilities(unittest.TestCase):
+    def test_capabilities_lines(self):
+        h = make_handler(stdin_text="capabilities\n")
+        h.run()
+        out = h.stdout.getvalue()
+        self.assertIn("import\n", out)
+        self.assertIn("export\n", out)
+        self.assertIn("refspec refs/heads/*:refs/remotes/fake/*\n", out)
+        self.assertIn("*push\n", out)
+        self.assertIn("*fetch\n", out)
+        self.assertTrue(out.endswith("\n\n"))
+
+    def test_capabilities_flushes(self):
+        h = make_handler(stdin_text="capabilities\n")
+        h.run()
+        self.assertGreater(h.stdout.flush_count, 5)
+
+
+class TestProtocolList(unittest.TestCase):
+    def test_list(self):
+        h = make_handler(stdin_text="list\n")
+        h.run()
+        self.assertEqual(h.stdout.getvalue(), "? refs/heads/main\n\n")
+
+    def test_list_for_push(self):
+        h = make_handler(stdin_text="list for-push\n")
+        h.run()
+        self.assertEqual(h.stdout.getvalue(), "? refs/heads/main\n\n")
+
+
+class TestProtocolImport(unittest.TestCase):
+    def _task(self, tid, **kw):
+        t = grt.empty_task()
+        t.update(id=tid, source="fake", title=tid,
+                 updated_date="2025-01-01T00:00:00Z")
+        t.update(kw)
+        return t
+
+    def test_single_import_writes_stream(self):
+        driver = FakeDriver(tasks=[self._task("fake-b"), self._task("fake-a")])
+        h = make_handler(driver=driver,
+                         stdin_text="import refs/heads/main\n\n")
+        h.run()
+        out = h.stdout.getvalue()
+        self.assertEqual(out.count("blob\n"), 2)
+        self.assertIn("deleteall\n", out)
+        self.assertTrue(out.rstrip().endswith("done"))
+
+    def test_blob_byte_length_correct(self):
+        t = self._task("fake-a", title="üñîçödé")
+        driver = FakeDriver(tasks=[t])
+        h = make_handler(driver=driver,
+                         stdin_text="import refs/heads/main\n\n")
+        h.run()
+        body = grt.YAMLSerializer().serialize(t).encode("utf-8")
+        self.assertIn(f"data {len(body)}\n".encode("utf-8").decode("utf-8"),
+                      h.stdout.getvalue())
+
+    def test_empty_task_list_still_valid(self):
+        driver = FakeDriver(tasks=[])
+        h = make_handler(driver=driver,
+                         stdin_text="import refs/heads/main\n\n")
+        h.run()
+        out = h.stdout.getvalue()
+        self.assertIn("deleteall\n", out)
+        self.assertNotIn("blob\n", out)
+        self.assertTrue(out.rstrip().endswith("done"))
+
+    def test_tasks_sorted_deterministic(self):
+        ids = ["fake-c", "fake-a", "fake-b"]
+        driver = FakeDriver(tasks=[self._task(i) for i in ids])
+        h = make_handler(driver=driver,
+                         stdin_text="import refs/heads/main\n\n")
+        h.run()
+        out = h.stdout.getvalue()
+        pa = out.index("tasks/fake-a.yaml")
+        pb = out.index("tasks/fake-b.yaml")
+        pc = out.index("tasks/fake-c.yaml")
+        self.assertLess(pa, pb)
+        self.assertLess(pb, pc)
+
+    def test_import_batch_consumes_lines(self):
+        driver = FakeDriver(tasks=[self._task("fake-a")])
+        stdin = "import refs/heads/main\nimport refs/heads/other\n\n"
+        h = make_handler(driver=driver, stdin_text=stdin)
+        h.run()
+        self.assertIn("deleteall\n", h.stdout.getvalue())
+
+    def test_commit_message_format(self):
+        driver = FakeDriver(tasks=[self._task("fake-a")])
+        h = make_handler(driver=driver,
+                         stdin_text="import refs/heads/main\n\n")
+        h.run()
+        self.assertRegex(h.stdout.getvalue(),
+                         r"tasks: import fake \(1 tasks\) \[2025-01-01T00:00:00Z\]")
+
+    def test_latest_updated_no_dates(self):
+        driver = FakeDriver(tasks=[self._task("fake-a", updated_date=None,
+                                              created_date=None)])
+        h = make_handler(driver=driver,
+                         stdin_text="import refs/heads/main\n\n")
+        h.run()
+        self.assertIn("tasks: import fake", h.stdout.getvalue())
+
+    def test_latest_updated_bad_dates(self):
+        driver = FakeDriver(tasks=[self._task("fake-a", updated_date="nope")])
+        h = make_handler(driver=driver,
+                         stdin_text="import refs/heads/main\n\n")
+        h.run()
+        self.assertIn("deleteall", h.stdout.getvalue())
+
+
+class TestProtocolExport(unittest.TestCase):
+    def _export_stream_modify(self, task: dict, ext="yaml") -> str:
+        body = grt.YAMLSerializer().serialize(task) if ext == "yaml" \
+               else grt.OrgSerializer().serialize(task)
+        blen = len(body.encode("utf-8"))
+        msg = "push"
+        return (
+            "export\n"
+            f"blob\nmark :1\ndata {blen}\n{body}\n"
+            "commit refs/heads/main\n"
+            f"author git <g@g> 1700000000 +0000\n"
+            f"committer git <g@g> 1700000000 +0000\n"
+            f"data {len(msg)}\n{msg}\n"
+            f"M 100644 :1 tasks/{task['id']}.{ext}\n"
+            "\ndone\n"
+        )
+
+    def test_modify_calls_upsert(self):
+        driver = FakeDriver()
+        task = full_task(id="jira-X")
+        stream = self._export_stream_modify(task)
+        h = make_handler(driver=driver, stdin_text=stream)
+        h.run()
+        self.assertEqual(len(driver.upserted), 1)
+        self.assertEqual(driver.upserted[0]["id"], "jira-X")
+
+    def test_delete_calls_driver(self):
+        driver = FakeDriver()
+        stream = (
+            "export\n"
+            "commit refs/heads/main\n"
+            "committer g <g@g> 1700000000 +0000\n"
+            "data 3\nhey\n"
+            "D tasks/jira-XYZ.yaml\n"
+            "\ndone\n"
+        )
+        h = make_handler(driver=driver, stdin_text=stream)
+        h.run()
+        self.assertEqual(driver.deleted, ["jira-XYZ"])
+
+    def test_non_tasks_path_ignored(self):
+        driver = FakeDriver()
+        stream = (
+            "export\n"
+            "commit refs/heads/main\n"
+            "committer g <g@g> 0 +0000\n"
+            "data 3\nhey\n"
+            "M 100644 :1 README.md\n"
+            "D other/file.txt\n"
+            "\ndone\n"
+        )
+        h = make_handler(driver=driver, stdin_text=stream)
+        h.run()
+        self.assertEqual(driver.upserted, [])
+        self.assertEqual(driver.deleted, [])
+
+    def test_export_ok_line_written(self):
+        driver = FakeDriver()
+        stream = "export\ncommit refs/heads/feature\ndone\n"
+        h = make_handler(driver=driver, stdin_text=stream)
+        h.run()
+        self.assertIn("ok refs/heads/feature\n", h.stdout.getvalue())
+
+    def test_export_upsert_not_implemented_logged(self):
+        class DriverNoUp(FakeDriver):
+            def upsert(self, task):
+                raise NotImplementedError("nope")
+        task = full_task(id="jira-X")
+        stream = self._export_stream_modify(task)
+        h = make_handler(driver=DriverNoUp(), stdin_text=stream)
+        h.run()
+        self.assertIn("upsert not implemented", h.stderr.getvalue())
+
+    def test_export_delete_not_implemented_logged(self):
+        class DriverNoDel(FakeDriver):
+            def delete(self, task_id):
+                raise NotImplementedError("nope")
+        stream = (
+            "export\n"
+            "commit refs/heads/main\n"
+            "D tasks/jira-X.yaml\n"
+            "\ndone\n"
+        )
+        h = make_handler(driver=DriverNoDel(), stdin_text=stream)
+        h.run()
+        self.assertIn("delete not implemented", h.stderr.getvalue())
+
+    def test_unknown_extension_in_export_logged(self):
+        driver = FakeDriver()
+        stream = (
+            "export\n"
+            "commit refs/heads/main\n"
+            "blob\nmark :1\ndata 3\nabc\n"
+            "M 100644 :1 tasks/weird.json\n"
+            "\ndone\n"
+        )
+        h = make_handler(driver=driver, stdin_text=stream)
+        h.run()
+        self.assertIn("unknown task file extension", h.stderr.getvalue())
+
+    def test_missing_blob_content_logged(self):
+        driver = FakeDriver()
+        stream = (
+            "export\n"
+            "commit refs/heads/main\n"
+            "M 100644 :99 tasks/jira-X.yaml\n"
+            "\ndone\n"
+        )
+        h = make_handler(driver=driver, stdin_text=stream)
+        h.run()
+        self.assertIn("no blob content", h.stderr.getvalue())
+
+    def test_export_default_ref(self):
+        driver = FakeDriver()
+        stream = "export\ndone\n"
+        h = make_handler(driver=driver, stdin_text=stream)
+        h.run()
+        self.assertIn("ok refs/heads/main\n", h.stdout.getvalue())
+
+
+class TestProtocolUnknown(unittest.TestCase):
+    def test_unknown_command_logged(self):
+        h = make_handler(stdin_text="wat is dis\n")
+        h.run()
+        self.assertIn("unknown command", h.stderr.getvalue())
+
+    def test_blank_line_ignored(self):
+        h = make_handler(stdin_text="\n\n")
+        h.run()
+        self.assertEqual(h.stdout.getvalue(), "")
+
+
+# ---------------------------------------------------------------------------
+# Management commands
+# ---------------------------------------------------------------------------
+
+class TestManagementCommands(unittest.TestCase):
+    def test_list_schemes_prints_all(self):
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stdout", buf):
+            args = mock.Mock()
+            grt.cmd_list_schemes(args)
+        for scheme in grt.SCHEMES:
+            self.assertIn(scheme, buf.getvalue())
+
+    def test_install_creates_symlinks(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = mock.Mock(bin_dir=d)
+            with mock.patch.dict(os.environ, {"PATH": d}):
+                grt.cmd_install(args)
+            for scheme in grt.SCHEMES:
+                link = Path(d) / f"git-remote-{scheme}"
+                self.assertTrue(link.is_symlink())
+
+    def test_install_warns_if_not_on_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = mock.Mock(bin_dir=d)
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, {"PATH": "/opt/nothing"}), \
+                    mock.patch.object(sys, "stderr", err):
+                grt.cmd_install(args)
+            self.assertIn("not on PATH", err.getvalue())
+
+    def test_install_replaces_existing(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = mock.Mock(bin_dir=d)
+            (Path(d) / "git-remote-jira").write_text("old")
+            with mock.patch.dict(os.environ, {"PATH": d}):
+                grt.cmd_install(args)
+            self.assertTrue((Path(d) / "git-remote-jira").is_symlink())
+
+    def test_uninstall_removes_symlinks(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = mock.Mock(bin_dir=d)
+            with mock.patch.dict(os.environ, {"PATH": d}):
+                grt.cmd_install(args)
+            grt.cmd_uninstall(args)
+            for scheme in grt.SCHEMES:
+                self.assertFalse((Path(d) / f"git-remote-{scheme}").exists())
+
+    def test_uninstall_missing_ok(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = mock.Mock(bin_dir=d)
+            # nothing installed; should not raise
+            rc = grt.cmd_uninstall(args)
+            self.assertEqual(rc, 0)
+
+    def test_check_missing_config(self):
+        err = io.StringIO()
+        with mock.patch.object(grt, "read_remote_config", return_value={}), \
+                mock.patch.object(sys, "stderr", err):
+            rc = grt.cmd_check(mock.Mock(remote_name="nope"))
+        self.assertEqual(rc, 2)
+        self.assertIn("no config", err.getvalue())
+
+    def test_check_invalid_scheme(self):
+        err = io.StringIO()
+        with mock.patch.object(grt, "read_remote_config",
+                                return_value={"scheme": "xml"}), \
+                mock.patch.object(sys, "stderr", err):
+            rc = grt.cmd_check(mock.Mock(remote_name="x"))
+        self.assertEqual(rc, 2)
+        self.assertIn("invalid scheme", err.getvalue())
+
+    def test_check_missing_required_key(self):
+        err = io.StringIO()
+        out = io.StringIO()
+        with mock.patch.object(grt, "read_remote_config",
+                                return_value={"scheme": "jira", "baseUrl": "x"}), \
+                mock.patch.object(sys, "stderr", err), \
+                mock.patch.object(sys, "stdout", out):
+            rc = grt.cmd_check(mock.Mock(remote_name="jira-work"))
+        self.assertEqual(rc, 2)
+        self.assertIn("missing required keys", err.getvalue())
+
+    def test_check_ok(self):
+        out = io.StringIO()
+        with mock.patch.object(grt, "read_remote_config",
+                                return_value={"scheme": "jira",
+                                              "baseUrl": "u",
+                                              "email": "e",
+                                              "apiToken": "t"}), \
+                mock.patch.object(sys, "stdout", out):
+            rc = grt.cmd_check(mock.Mock(remote_name="jira-work"))
+        self.assertEqual(rc, 0)
+        self.assertIn("ok: all required", out.getvalue())
+        self.assertIn("<redacted>", out.getvalue())
+
+    def test_argparser_builds(self):
+        p = grt.build_argparser()
+        ns = p.parse_args(["install", "--bin-dir", "/tmp/x"])
+        self.assertEqual(ns.cmd, "install")
+        self.assertEqual(ns.bin_dir, "/tmp/x")
+
+
+# ---------------------------------------------------------------------------
+# Main entry point dispatch
+# ---------------------------------------------------------------------------
+
+class TestMainDispatch(unittest.TestCase):
+    def test_main_list_schemes(self):
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out):
+            rc = grt.main(["git_remote_tasks.py", "list-schemes"])
+        self.assertEqual(rc, 0)
+        self.assertIn("jira", out.getvalue())
+
+    def test_main_no_args_prints_help(self):
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out):
+            rc = grt.main(["git_remote_tasks.py"])
+        self.assertEqual(rc, 0)
+        self.assertIn("usage", out.getvalue().lower())
+
+    def test_main_scheme_from_name(self):
+        with mock.patch.object(grt, "_run_helper", return_value=0) as rh:
+            rc = grt.main(["git-remote-jira", "jira-work", "jira://x"])
+        self.assertEqual(rc, 0)
+        rh.assert_called_once_with("jira", "jira-work", "jira://x")
+
+    def test_main_scheme_from_name_missing_args(self):
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err):
+            rc = grt.main(["git-remote-jira"])
+        self.assertEqual(rc, 2)
+
+    def test_main_scheme_from_url(self):
+        with mock.patch.object(grt, "_run_helper", return_value=0) as rh:
+            rc = grt.main(["git_remote_tasks.py", "v", "vikunja://h"])
+        self.assertEqual(rc, 0)
+        rh.assert_called_once()
+
+    def test_main_check_subcommand(self):
+        with mock.patch.object(grt, "read_remote_config",
+                                return_value={"scheme": "jira",
+                                              "baseUrl": "u", "email": "e",
+                                              "apiToken": "t"}), \
+                mock.patch.object(sys, "stdout", io.StringIO()):
+            rc = grt.main(["git_remote_tasks.py", "check", "jira-work"])
+        self.assertEqual(rc, 0)
+
+    def test_run_helper_invokes_handler(self):
+        with mock.patch.object(grt, "read_remote_config",
+                                return_value={"scheme": "jira"}), \
+                mock.patch.object(grt, "read_format", return_value="yaml"), \
+                mock.patch.object(grt.ProtocolHandler, "run") as run:
+            rc = grt._run_helper("jira", "jira-work", "jira://x")
+        self.assertEqual(rc, 0)
+        run.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# HTTP request wiring (lightly, via mocking urllib)
+# ---------------------------------------------------------------------------
+
+class TestHttpWiring(unittest.TestCase):
+    def test_http_request_builds_request(self):
+        d = grt.JiraDriver("r", "https://x", {})
+        captured = {}
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self): return b'{"ok":true}'
+        def fake_urlopen(req):
+            captured["method"] = req.get_method()
+            captured["url"] = req.full_url
+            captured["data"] = req.data
+            return FakeResp()
+        with mock.patch.object(grt.urllib.request, "urlopen", fake_urlopen):
+            result = d._http_request("POST", "https://x/api",
+                                     headers={"Authorization": "Basic x"},
+                                     body={"k": "v"})
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(captured["method"], "POST")
+        self.assertIn(b'"k"', captured["data"])
+
+
+# ---------------------------------------------------------------------------
+# Coverage-targeted edge cases
+# ---------------------------------------------------------------------------
+
+class TestYamlEdgeCases(unittest.TestCase):
+    def setUp(self):
+        self.s = grt.YAMLSerializer()
+
+    def test_needs_quoting_empty(self):
+        self.assertTrue(grt._yaml_needs_quoting(""))
+
+    def test_needs_quoting_reserved(self):
+        self.assertTrue(grt._yaml_needs_quoting("true"))
+        self.assertTrue(grt._yaml_needs_quoting("Yes"))
+
+    def test_needs_quoting_leading_special(self):
+        for ch in "!&*?|>'\"%@`#":
+            self.assertTrue(grt._yaml_needs_quoting(ch + "rest"))
+
+    def test_needs_quoting_dash_space_prefix(self):
+        self.assertTrue(grt._yaml_needs_quoting("- item"))
+
+    def test_needs_quoting_dash_then_space(self):
+        self.assertTrue(grt._yaml_needs_quoting("- x"))
+
+    def test_needs_quoting_colon_space(self):
+        self.assertTrue(grt._yaml_needs_quoting("foo: bar"))
+
+    def test_needs_quoting_hash_in_middle(self):
+        self.assertTrue(grt._yaml_needs_quoting("a #b"))
+
+    def test_needs_quoting_leading_trailing_ws(self):
+        self.assertTrue(grt._yaml_needs_quoting(" x"))
+
+    def test_scalar_none(self):
+        self.assertEqual(grt._yaml_scalar(None), "null")
+
+    def test_scalar_newline_fallback(self):
+        self.assertEqual(grt._yaml_scalar("a\nb"), r'"a\nb"')
+
+    def test_parse_malformed_line_skipped(self):
+        text = "id: x\n*** bogus ***\nsource: s\ntitle: t\n"
+        back = self.s.deserialize(text)
+        self.assertEqual(back["id"], "x")
+        self.assertEqual(back["source"], "s")
+
+    def test_parse_indented_top_level_skipped(self):
+        text = "  leading: indent\nid: x\n"
+        back = self.s.deserialize(text)
+        self.assertEqual(back["id"], "x")
+
+    def test_parse_nested_empty_value(self):
+        text = "id: x\ncategory:\n"  # no indented content
+        back = self.s.deserialize(text)
+        # category should fall through to defaults
+        self.assertEqual(back["category"]["type"], "other")
+
+    def test_parse_missing_required_defaults_to_strings(self):
+        # Provide explicit null for id/source/status/priority.
+        text = "id: null\nsource: null\ntitle: null\nstatus: null\npriority: null\n"
+        back = self.s.deserialize(text)
+        self.assertEqual(back["id"], "")
+        self.assertEqual(back["source"], "")
+        self.assertEqual(back["title"], "")
+        self.assertEqual(back["status"], "todo")
+        self.assertEqual(back["priority"], "none")
+
+    def test_parse_sequence_with_blank_line(self):
+        text = "tags:\n  - a\n\n  - b\n"
+        back = self.s._parse(text)
+        self.assertEqual(back["tags"], ["a", "b"])
+
+    def test_parse_sequence_terminates_on_dedent(self):
+        text = "tags:\n  - a\nother: z\n"
+        back = self.s._parse(text)
+        self.assertEqual(back["tags"], ["a"])
+        self.assertEqual(back["other"], "z")
+
+    def test_parse_nested_map_with_blank_line_and_dedent(self):
+        text = "category:\n  id: A\n\n  name: B\nother: z\n"
+        back = self.s._parse(text)
+        self.assertEqual(back["category"], {"id": "A", "name": "B"})
+        self.assertEqual(back["other"], "z")
+
+    def test_parse_block_scalar_with_blank_line(self):
+        text = "description: |\n  a\n\n  b\n"
+        back = self.s._parse(text)
+        self.assertEqual(back["description"], "a\n\nb")
+
+
+class TestOrgEdgeCases(unittest.TestCase):
+    def test_iso_no_time(self):
+        self.assertEqual(grt._iso_to_org_timestamp("2025-04-20"), "[2025-04-20 Sun]")
+
+    def test_iso_with_tz(self):
+        token = grt._iso_to_org_timestamp("2025-04-20T12:30:00+03:00")
+        self.assertTrue(token.startswith("[2025-04-20 Sun"))
+
+    def test_iso_naive_datetime_assumed_utc(self):
+        token = grt._iso_to_org_timestamp("2025-04-20T00:00:00")
+        self.assertIn("2025-04-20", token)
+
+    def test_org_to_iso_without_weekday(self):
+        self.assertEqual(grt._org_timestamp_to_iso("[2025-04-20]"), "2025-04-20")
+
+    def test_org_to_iso_single_digit_hour(self):
+        self.assertEqual(grt._org_timestamp_to_iso("[2025-04-20 Sun 9:30]"),
+                         "2025-04-20T09:30:00Z")
+
+
+class TestMSTodoMsalFlag(unittest.TestCase):
+    def test_msal_available_constant_boolean(self):
+        self.assertIsInstance(grt.MSAL_AVAILABLE, bool)
+
+
+class TestProtocolExportEdge(unittest.TestCase):
+    def test_m_line_too_short_ignored(self):
+        driver = FakeDriver()
+        stream = "export\ncommit refs/heads/main\nM only-two\ndone\n"
+        h = make_handler(driver=driver, stdin_text=stream)
+        h.run()
+        self.assertEqual(driver.upserted, [])
+
+    def test_d_line_too_short_ignored(self):
+        driver = FakeDriver()
+        stream = "export\ncommit refs/heads/main\nD\ndone\n"
+        h = make_handler(driver=driver, stdin_text=stream)
+        h.run()
+        self.assertEqual(driver.deleted, [])
+
+    def test_author_lines_skipped(self):
+        driver = FakeDriver()
+        stream = (
+            "export\n"
+            "commit refs/heads/main\n"
+            "author g <g@g> 0 +0000\n"
+            "from :1\n"
+            "reset refs/heads/foo\n"
+            "done\n"
+        )
+        h = make_handler(driver=driver, stdin_text=stream)
+        h.run()
+        self.assertIn("ok refs/heads/main", h.stdout.getvalue())
+
+
+class TestMainEntryEdge(unittest.TestCase):
+    def test_main_check_unknown_scheme_returns_2(self):
+        with mock.patch.object(grt, "read_remote_config",
+                                return_value={"scheme": "unknown"}), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            rc = grt.main(["git_remote_tasks.py", "check", "x"])
+        self.assertEqual(rc, 2)
+
+    def test_main_unknown_args_prints_help(self):
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out):
+            rc = grt.main(["git_remote_tasks.py", "random-arg"])
+        self.assertEqual(rc, 0)
+        self.assertIn("usage", out.getvalue().lower())
+
+
+class TestCategoryEdge(unittest.TestCase):
+    def test_normalize_task_ignores_unknown_keys(self):
+        t = grt.normalize_task({"id": "x", "unknown_field": "whatever"})
+        self.assertEqual(t["id"], "x")
+        self.assertNotIn("unknown_field", t)
+
+
+class TestReadBlockScalarEof(unittest.TestCase):
+    def test_trailing_empty_lines_trimmed(self):
+        text = "description: |\n  a\n  b\n\n\n"
+        p = grt.YAMLSerializer()._parse(text)
+        self.assertEqual(p["description"], "a\nb")
+
+
+if __name__ == "__main__":
+    unittest.main()
