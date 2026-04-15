@@ -83,3 +83,69 @@ mkdir /tmp/tkt && /path/to/tasks-init --format yaml --dir /tmp/tkt
   available, falling back to a UTF-8 text write otherwise. The fallback
   is exercised only in tests using `io.StringIO`; real git invocations
   always expose `buffer`.
+
+## 2026-04-15 — Adversarial review and PLAN.md
+
+Reviewed the full delivery (code + tests + README + WORKLOG) against the
+"what would break this in real use" question, then combined the review
+findings with three product decisions the user raised:
+
+1. documentation is a last-resort warning, not a fix;
+2. push should work for every non-pull-only remote, not just Notion's
+   explicit refusal;
+3. custom field / status / priority mapping must be a first-class
+   concept, as it is in the ancestor project `todo-harvest`
+   (`todo-harvest/src/normalizer.py` applies `status_map`,
+   `priority_map`, `field_map` per source).
+
+### Bugs uncovered
+
+- **Jira epic name drops to `None`** for the realistic dict-shaped
+  `customfield_10014` payload — a Python operator-precedence bug in the
+  inline ternary. Only the string branch is covered by tests.
+- **`git push` reports `ok <ref>` even when every upsert raised
+  `NotImplementedError`.** Users see exit 0 and trust that writes
+  landed. This is the single most misleading behaviour in the cut.
+- **`ProtocolHandler._read_exactly`** calls `stdin.read(n)` on the
+  text-stream fallback path; `n` is a byte count, so multi-byte UTF-8
+  bodies are silently truncated. Not hit in production (git provides
+  `stdin.buffer`), but advertised as "defensive" — it is actively wrong.
+- **Every fetch is a root commit.** No `from :mark` is emitted, so
+  `refs/remotes/<remote>/main` never forms a linear history and
+  `git merge <remote>/main` fails without
+  `--allow-unrelated-histories`. README Quick Start teaches the broken
+  form; only `tasks-init`'s stdout hints at the flag.
+- **Timezones silently normalize to UTC** in `_iso_to_org_timestamp`.
+  Documented in this worklog, not in the README; for an agenda user this
+  shifts the displayed due-hour.
+- **`cmd_uninstall` unlinks any file** named `git-remote-<scheme>` —
+  including unrelated helpers installed into the same bin dir.
+- **Secret redaction in `check`** matches only `token`/`password`
+  substrings, leaking `apiKey`, `clientSecret`, `access*`, etc.
+- Plus: Jira task URL falls back to the `jira://` scheme, `msftodo`
+  `check` passes without a token, org `:DEADLINE:` is stored as a
+  property (not agenda-visible), YAML nested hyphen keys vanish.
+
+### Design decisions reached
+
+- **`tasks-init` stays `git init`-shaped.** `git clone` would force us
+  to refuse non-empty directories and would assume a source URL we do
+  not have at init time. Planned change: replace `--dir` with a
+  positional optional path, matching `git init [path]`.
+- **Custom mapping** will be expressed as per-remote git-config keys
+  (`tasks-remote.<name>.statusMap.*`, `priorityMap.*`, `fieldMap.*`,
+  `jqlFilter`, `projectId`), applied in both directions. Unknown values
+  fall back to the unified default *and* warn on stderr, never silently.
+- **Runtime warnings are mandatory** for any surviving limitation.
+  Documentation is additive, never a substitute.
+
+### Deliverable
+
+- `PLAN.md` captures every finding with IDs (BUG-/FEAT-/SEC-/DX-/TEST-/
+  DOC-), priorities (P0/P1/P2), and an execution order. Eighteen
+  concrete tasks plus four P2 docs notes that will be deleted as the
+  backing fixes land.
+
+Next action: tackle P0 correctness (BUG-01, BUG-04, BUG-05, BUG-07,
+SEC-01, SEC-02) and the runtime-honesty pair (BUG-02, FEAT-04) before
+the write paths (FEAT-01 → FEAT-02 → FEAT-03).
