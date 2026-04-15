@@ -59,8 +59,9 @@ reading its own `argv[0]` basename.
 
 ```bash
 # One-time repo setup.
-tasks-init --format yaml --dir ~/work/tasks
+python git_remote_tasks.py init --format yaml ~/work/tasks
 cd ~/work/tasks
+# (Equivalent: if symlinks are installed, `tasks-init --format yaml ~/work/tasks`.)
 
 # Add a Vikunja remote.
 git remote add vikunja vikunja://localhost:3456

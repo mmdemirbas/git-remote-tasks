@@ -1572,6 +1572,97 @@ class TestManagementCommands(unittest.TestCase):
         self.assertEqual(ns.bin_dir, "/tmp/x")
 
 
+class TestCmdInit(unittest.TestCase):
+    def _run(self, *argv_extra, cwd=None, input_fn=None):
+        """Helper: set up a temp dir and drive cmd_init with argparse."""
+        parser = grt.build_argparser()
+        ns = parser.parse_args(["init", *argv_extra])
+        ns._input_fn = input_fn or (lambda _p: "yaml")
+        old = Path.cwd()
+        if cwd:
+            os.chdir(str(cwd))
+        try:
+            with mock.patch.object(sys, "stdout", io.StringIO()):
+                rc = grt.cmd_init(ns)
+            return rc
+        finally:
+            os.chdir(str(old))
+
+    def test_init_in_empty_dir_creates_git_and_tasks(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc = self._run("--format", "yaml", cwd=Path(d))
+            self.assertEqual(rc, 0)
+            self.assertTrue((Path(d) / ".git").is_dir())
+            self.assertTrue((Path(d) / "tasks" / ".gitkeep").exists())
+            fmt = subprocess.run(
+                ["git", "-C", d, "config", "--local", "--get", "tasks.format"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            self.assertEqual(fmt, "yaml")
+
+    def test_init_with_positional_path_creates_and_enters(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "repo"
+            rc = self._run("--format", "org", str(target))
+            self.assertEqual(rc, 0)
+            self.assertTrue((target / ".git").is_dir())
+            fmt = subprocess.run(
+                ["git", "-C", str(target), "config", "--local", "--get",
+                 "tasks.format"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            self.assertEqual(fmt, "org")
+
+    def test_init_prompts_when_format_missing(self):
+        prompts: list[str] = []
+        def _input(prompt: str) -> str:
+            prompts.append(prompt)
+            return "org"
+        with tempfile.TemporaryDirectory() as d:
+            rc = self._run(cwd=Path(d), input_fn=_input)
+        self.assertEqual(rc, 0)
+        self.assertTrue(prompts, "should have prompted")
+
+    def test_init_rerun_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._run("--format", "yaml", cwd=Path(d))
+            # Count commits; second init should not add one.
+            first = subprocess.run(
+                ["git", "-C", d, "rev-list", "--count", "HEAD"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            self._run("--format", "yaml", cwd=Path(d))
+            second = subprocess.run(
+                ["git", "-C", d, "rev-list", "--count", "HEAD"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            self.assertEqual(first, second,
+                              "re-running init must not create a new commit")
+
+    def test_main_dispatches_tasks_init_symlink(self):
+        with mock.patch.object(grt, "cmd_init", return_value=0) as ci:
+            rc = grt.main(["/usr/local/bin/tasks-init",
+                            "--format", "yaml", "/tmp/x"])
+        self.assertEqual(rc, 0)
+        ci.assert_called_once()
+
+    def test_install_includes_tasks_init_symlink(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = mock.Mock(bin_dir=d)
+            with mock.patch.dict(os.environ, {"PATH": d}):
+                grt.cmd_install(args)
+            self.assertTrue((Path(d) / "tasks-init").is_symlink())
+
+    def test_uninstall_removes_tasks_init_symlink(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = mock.Mock(bin_dir=d)
+            with mock.patch.dict(os.environ, {"PATH": d}):
+                grt.cmd_install(args)
+            self.assertTrue((Path(d) / "tasks-init").is_symlink())
+            grt.cmd_uninstall(args)
+            self.assertFalse((Path(d) / "tasks-init").exists())
+
+
 # ---------------------------------------------------------------------------
 # Main entry point dispatch
 # ---------------------------------------------------------------------------

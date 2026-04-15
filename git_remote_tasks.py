@@ -1769,11 +1769,17 @@ class ProtocolHandler:
 # Management subcommands
 # ============================================================================
 
-KNOWN_SUBCOMMANDS = {"install", "uninstall", "list-schemes", "check"}
+KNOWN_SUBCOMMANDS = {"install", "uninstall", "list-schemes", "check", "init"}
+
+INIT_SYMLINK_NAMES = ("tasks-init",)
 
 
 def _script_path() -> Path:
     return Path(os.path.abspath(__file__))
+
+
+def _install_symlink_names() -> list[str]:
+    return [f"git-remote-{s}" for s in SCHEMES] + list(INIT_SYMLINK_NAMES)
 
 
 def cmd_install(args) -> int:
@@ -1784,8 +1790,8 @@ def cmd_install(args) -> int:
         os.chmod(src, os.stat(src).st_mode | 0o111)
     except OSError as exc:
         print(f"warning: could not chmod {src}: {exc}", file=sys.stderr)
-    for scheme in SCHEMES:
-        link = bin_dir / f"git-remote-{scheme}"
+    for name in _install_symlink_names():
+        link = bin_dir / name
         if link.exists() or link.is_symlink():
             link.unlink()
         os.symlink(str(src), str(link))
@@ -1801,8 +1807,8 @@ def cmd_install(args) -> int:
 def cmd_uninstall(args) -> int:
     bin_dir = Path(os.path.expanduser(args.bin_dir)).resolve()
     src = _script_path()
-    for scheme in SCHEMES:
-        link = bin_dir / f"git-remote-{scheme}"
+    for name in _install_symlink_names():
+        link = bin_dir / name
         if not link.exists() and not link.is_symlink():
             print(f"skip {link} (not present)")
             continue
@@ -1834,6 +1840,88 @@ def cmd_uninstall(args) -> int:
 def cmd_list_schemes(args) -> int:
     for scheme, cls in SCHEMES.items():
         print(f"{scheme:10s} {cls.__name__}")
+    return 0
+
+
+def _prompt_format(input_fn=input) -> str:
+    while True:
+        choice = input_fn("Choose task file format [yaml/org]: ").strip()
+        if choice in ("yaml", "org"):
+            return choice
+        print("  → please enter 'yaml' or 'org'.")
+
+
+def cmd_init(args) -> int:
+    """Initialize a repo for task sync. Mirrors `git init [path]`.
+
+    Accepts an optional positional `path`; when given, the directory is
+    created (if missing) and entered before `git init` runs. When omitted,
+    init operates in the current directory.
+    """
+    fmt = getattr(args, "format", None)
+    target = getattr(args, "path", None)
+    input_fn = getattr(args, "_input_fn", input)
+
+    if target:
+        target_path = Path(target).expanduser()
+        target_path.mkdir(parents=True, exist_ok=True)
+        os.chdir(str(target_path))
+
+    if not fmt:
+        fmt = _prompt_format(input_fn=input_fn)
+    if fmt not in ("yaml", "org"):
+        print(f"tasks-init: --format must be 'yaml' or 'org' (got: {fmt!r})",
+              file=sys.stderr)
+        return 2
+
+    if not Path(".git").is_dir():
+        rc = subprocess.run(["git", "init", "--quiet"],
+                             capture_output=True, text=True).returncode
+        if rc != 0:
+            print("tasks-init: git init failed", file=sys.stderr)
+            return 1
+
+    if not write_config_value("tasks.format", fmt):
+        print("tasks-init: failed to write tasks.format to git config",
+              file=sys.stderr)
+        return 1
+
+    gitignore = Path(".gitignore")
+    if not gitignore.exists():
+        gitignore.write_text(
+            "# git-remote-tasks: nothing task-specific is ignored by default.\n"
+        )
+
+    tasks_dir = Path("tasks")
+    tasks_dir.mkdir(exist_ok=True)
+    (tasks_dir / ".gitkeep").touch()
+
+    subprocess.run(["git", "add", ".gitignore", "tasks/.gitkeep"],
+                    capture_output=True, text=True)
+    # Commit only when the index has something new — re-running init on an
+    # existing repo should be a no-op, not an empty-commit factory.
+    diff = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
+        capture_output=True, text=True,
+    )
+    if diff.returncode != 0:
+        subprocess.run(
+            ["git", "commit", "--quiet", "-m", f"tasks: init ({fmt} format)"],
+            capture_output=True, text=True,
+        )
+
+    cwd = Path.cwd()
+    print(f"\nRepo initialized with task format: {fmt}  (in {cwd})\n")
+    print("Next steps:")
+    print("  1. Install helper symlinks (once per machine):")
+    print(f"       python {Path(__file__).name} install --bin-dir ~/.local/bin")
+    print("  2. Configure a remote. See README §8 for per-service setup.")
+    print("  3. Fetch, edit, push:")
+    print("       git fetch <remote>")
+    print("       git merge <remote>/main --allow-unrelated-histories  # first time only")
+    print(f"       $EDITOR tasks/<remote>-<id>.{fmt}")
+    print("       git commit -am 'tasks: edit'")
+    print("       git push <remote> main")
     return 0
 
 
@@ -1897,6 +1985,15 @@ def build_argparser() -> argparse.ArgumentParser:
     p_check = sub.add_parser("check", help="validate config for a remote")
     p_check.add_argument("remote_name")
 
+    p_init = sub.add_parser(
+        "init",
+        help="initialize a repo for task sync (like `git init [path]`)",
+    )
+    p_init.add_argument("--format", choices=("yaml", "org"),
+                        help="task file format; prompts interactively if omitted")
+    p_init.add_argument("path", nargs="?", default=None,
+                        help="target directory (created if missing); defaults to cwd")
+
     return parser
 
 
@@ -1907,6 +2004,7 @@ def build_argparser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     prog = argv[0] if argv else ""
+    prog_base = os.path.basename(prog)
 
     # Case 1: invoked as git-remote-<scheme>
     scheme = scheme_for_name(prog)
@@ -1916,7 +2014,14 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         return _run_helper(scheme, argv[1], argv[2])
 
-    # Case 2: management subcommand
+    # Case 2a: invoked as `tasks-init` (symlink). Rewrite argv so the shared
+    # argparser sees `init` as the subcommand.
+    if prog_base in INIT_SYMLINK_NAMES:
+        parser = build_argparser()
+        args = parser.parse_args(["init", *argv[1:]])
+        return cmd_init(args)
+
+    # Case 2b: management subcommand.
     if len(argv) >= 2 and argv[1] in KNOWN_SUBCOMMANDS:
         parser = build_argparser()
         args = parser.parse_args(argv[1:])
@@ -1928,6 +2033,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_list_schemes(args)
         if args.cmd == "check":
             return cmd_check(args)
+        if args.cmd == "init":
+            return cmd_init(args)
         return 2
 
     # Case 3: direct invocation as helper (scheme from URL)
