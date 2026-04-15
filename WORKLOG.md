@@ -1,5 +1,79 @@
 # Work log
 
+## 2026-04-15 — First live run against all four services
+
+Exercised every driver end-to-end against real remotes (Vikunja on
+localhost, Jira Cloud, Notion, MS Todo). Four regressions surfaced, one
+per bug class. All of them were invisible to the stdlib suite because
+the suite never wired a fast-export stream into the handler through a
+real `sys.stdin`.
+
+### Regressions fixed
+
+- **`*fetch` / `*push` advertised as capabilities.** The helper only
+  implements `import` and `export`. Git preferred the native
+  `fetch` / `push` commands and then failed with
+  `unknown command: 'fetch <sha> <ref>'`. Removed both lines from
+  `_cmd_capabilities`.
+- **`commit refs/heads/main` clobbered the user's own branch.** The
+  refspec capability named `refs/remotes/<name>/*` as the destination
+  but `_emit_commit_header` still wrote to `refs/heads/main`. Fast-import
+  refused to fast-forward:
+  `Not updating refs/heads/main (new tip X does not contain Y)`.
+  Switched to a private namespace, matching the `git-remote-testgit`
+  convention:
+  - capability: `refspec refs/heads/*:refs/tasks/<name>/heads/*`
+  - header: `commit refs/tasks/<name>/heads/main`
+  Git reads from the private ref and applies the user's fetch refspec
+  to update `refs/remotes/<name>/main`.
+- **Export parser desync on real stdin.** `sys.stdin` is a
+  `TextIOWrapper` whose `readline()` buffers extra bytes in an internal
+  decode buffer. A subsequent `sys.stdin.buffer.read(n)` skips those
+  buffered bytes — the blob body loses its prefix, the parser reads a
+  URL value as the next `data N` header, and fast-export dies with
+  `invalid literal for int() with base 10: 'http://...'`. Introduced
+  `_BinaryStdinReader`: reads everything through the binary layer,
+  decodes a line at a time, exposes `.buffer` for exact-byte reads. No
+  second layer of buffering.
+- **`tasks/.gitkeep` rejected as a suspicious path.** The path-safety
+  check rightly rejects leading-dot names (`tasks/.git*`), but
+  `.gitkeep` is a universal repo-hygiene file and shouldn't fail a push.
+  Added `_is_task_file_path` as a cheap pre-filter: if the path doesn't
+  end in `.yaml`/`.yml`/`.org`, silently skip it. Applies to both `M`
+  and `D` directives. `tasks/README.md`, `tasks/notes.txt`, etc. are
+  now tolerated too.
+
+### Tests added
+- `test_import_writes_to_private_namespace` — pins the new refspec
+  destination.
+- `test_binary_stdin_reads_blob_bytes_accurately` — end-to-end with a
+  real `BytesIO` source mimicking git's binary stdin.
+- `test_binary_stdin_reader_readline_decodes` — unit coverage for the
+  shim.
+- `test_gitkeep_under_tasks_silently_ignored`,
+  `test_readme_under_tasks_silently_ignored`,
+  `test_delete_of_gitkeep_silently_ignored`,
+  `test_unknown_extension_in_export_silently_ignored` — four pins for
+  the non-task companion policy.
+- `TestTaskFilePath` class — positive / negative cases for the new
+  helper.
+
+324 → 332 tests. All green.
+
+### Verified live
+- Vikunja: full snapshot fetched, single-task priority edit pushed via
+  `POST /api/v1/tasks/{id}`; confirmed via direct API read that the
+  server-side `priority` and `updated` fields moved.
+- Jira Cloud, Notion: full snapshot fetched.
+- MS Todo: first run prompts for device-code auth; subsequent runs are
+  silent once the refresh token is persisted.
+
+### Notes
+- The capabilities fix is backwards-incompatible with any previously
+  fetched state: the first fetch after upgrade recreates
+  `refs/tasks/<name>/heads/main` (private) alongside the existing
+  `refs/remotes/<name>/main`. No user-visible change.
+
 ## 2026-04-15 — Initial implementation from SPEC.md
 
 ### Deliverables produced
