@@ -1067,6 +1067,12 @@ class ProtocolHandler:
         self.stdin = stdin if stdin is not None else sys.stdin
         self.stdout = stdout if stdout is not None else sys.stdout
         self.stderr = stderr if stderr is not None else sys.stderr
+        # Per-ref failure messages collected during an export. Populated by
+        # _handle_modify / _handle_delete; consumed by _cmd_export so we emit
+        # 'error <ref>' instead of lying with 'ok <ref>' when any task failed.
+        self.export_errors: dict[str, str] = {}
+        self.had_errors = False
+        self._warned_codes: set[str] = set()
 
     def _write(self, line: str) -> None:
         self.stdout.write(line)
@@ -1075,6 +1081,18 @@ class ProtocolHandler:
     def _log(self, msg: str) -> None:
         self.stderr.write(f"git-remote-tasks: {msg}\n")
         self.stderr.flush()
+
+    def _warn_once(self, code: str, msg: str) -> None:
+        """Emit a stderr warning at most once per run per code.
+
+        Limitations we cannot fix yet must be visible to the user on every
+        run that touches them; the `code` keyed dedupe stops a single fetch
+        from spamming the same warning N times.
+        """
+        if code in self._warned_codes:
+            return
+        self._warned_codes.add(code)
+        self._log(f"warning[{code}]: {msg}")
 
     def run(self) -> None:
         while True:
@@ -1204,6 +1222,7 @@ class ProtocolHandler:
         results: list[str] = []
         marks: dict[str, bytes] = {}
         current_ref: str | None = None
+        self.export_errors.clear()
         while True:
             line = self.stdin.readline()
             if not line:
@@ -1229,10 +1248,10 @@ class ProtocolHandler:
             if stripped.startswith(("author ", "committer ", "from ", "merge ", "original-oid ")):
                 continue
             if stripped.startswith("M "):
-                self._handle_modify(stripped, marks)
+                self._handle_modify(stripped, marks, current_ref)
                 continue
             if stripped.startswith("D "):
-                self._handle_delete(stripped)
+                self._handle_delete(stripped, current_ref)
                 continue
             if stripped.startswith(("reset ", "tag ", "feature ", "option ", "progress ")):
                 continue
@@ -1242,7 +1261,12 @@ class ProtocolHandler:
         if not results:
             results = [f"refs/heads/main"]
         for ref in results:
-            self._write(f"ok {ref}\n")
+            err = self.export_errors.get(ref)
+            if err:
+                self.had_errors = True
+                self._write(f"error {ref} {err}\n")
+            else:
+                self._write(f"ok {ref}\n")
         self._write("\n")
 
     def _read_exactly(self, n: int) -> bytes:
@@ -1272,7 +1296,14 @@ class ProtocolHandler:
             collected.extend(chunk)
         return bytes(collected)
 
-    def _handle_modify(self, line: str, marks: dict[str, bytes]) -> None:
+    def _record_export_error(self, ref: str | None, msg: str) -> None:
+        """Attach an error to the current ref so _cmd_export can emit 'error <ref>'."""
+        key = ref or "refs/heads/main"
+        # First failure wins; later ones still log but don't overwrite.
+        self.export_errors.setdefault(key, msg)
+
+    def _handle_modify(self, line: str, marks: dict[str, bytes],
+                       current_ref: str | None) -> None:
         # M <mode> <sha-or-mark> <path>
         parts = line.split(" ", 3)
         if len(parts) < 4:
@@ -1284,20 +1315,29 @@ class ProtocolHandler:
             serializer = serializer_for_extension(path)
         except ValueError as exc:
             self._log(str(exc))
+            self._record_export_error(current_ref, f"unknown extension: {path}")
             return
         content = marks.get(ref, b"")
         if not content:
             self._log(f"no blob content for {path}")
+            self._record_export_error(current_ref, f"no blob for {path}")
             return
         try:
             task = serializer.deserialize(content.decode("utf-8"))
             self.driver.upsert(task)
         except NotImplementedError as exc:
             self._log(f"upsert not implemented: {exc}")
+            self._warn_once(
+                "push-stub",
+                f"{self.driver.__class__.__name__} write path is not implemented yet; "
+                f"no changes were sent to the remote service.",
+            )
+            self._record_export_error(current_ref, "upsert not implemented")
         except Exception as exc:  # pragma: no cover - defensive
             self._log(f"upsert failed: {exc}")
+            self._record_export_error(current_ref, f"upsert failed: {exc}")
 
-    def _handle_delete(self, line: str) -> None:
+    def _handle_delete(self, line: str, current_ref: str | None) -> None:
         # D <path>
         parts = line.split(" ", 1)
         if len(parts) < 2:
@@ -1311,8 +1351,15 @@ class ProtocolHandler:
             self.driver.delete(task_id)
         except NotImplementedError as exc:
             self._log(f"delete not implemented: {exc}")
+            self._warn_once(
+                "push-stub",
+                f"{self.driver.__class__.__name__} write path is not implemented yet; "
+                f"no changes were sent to the remote service.",
+            )
+            self._record_export_error(current_ref, "delete not implemented")
         except Exception as exc:  # pragma: no cover - defensive
             self._log(f"delete failed: {exc}")
+            self._record_export_error(current_ref, f"delete failed: {exc}")
 
 
 # ============================================================================
@@ -1498,7 +1545,9 @@ def _run_helper(scheme: str, remote_name: str, url: str) -> int:
     serializer = serializer_for_format(read_format())
     handler = ProtocolHandler(remote_name, url, driver, serializer)
     handler.run()
-    return 0
+    # Non-zero when any ref's export reported an error so `git push` surfaces
+    # the failure instead of silently appearing to succeed.
+    return 1 if handler.had_errors else 0
 
 
 if __name__ == "__main__":

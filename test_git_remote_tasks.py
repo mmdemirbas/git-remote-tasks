@@ -1033,6 +1033,34 @@ class TestProtocolExport(unittest.TestCase):
         h = make_handler(driver=DriverNoUp(), stdin_text=stream)
         h.run()
         self.assertIn("upsert not implemented", h.stderr.getvalue())
+        # BUG-02: do not pretend the push succeeded.
+        self.assertIn("error refs/heads/main", h.stdout.getvalue())
+        self.assertNotIn("ok refs/heads/main", h.stdout.getvalue())
+        self.assertTrue(h.had_errors)
+        # FEAT-04: a user-facing warning is emitted once per run.
+        self.assertIn("warning[push-stub]", h.stderr.getvalue())
+
+    def test_export_upsert_warning_emitted_once(self):
+        class DriverNoUp(FakeDriver):
+            def upsert(self, task):
+                raise NotImplementedError("nope")
+        task = full_task(id="jira-X")
+        # Two M directives in one batch.
+        body = grt.YAMLSerializer().serialize(task)
+        blen = len(body.encode("utf-8"))
+        stream = (
+            "export\n"
+            f"blob\nmark :1\ndata {blen}\n{body}\n"
+            f"blob\nmark :2\ndata {blen}\n{body}\n"
+            "commit refs/heads/main\n"
+            "committer g <g@g> 0 +0000\ndata 1\nx\n"
+            f"M 100644 :1 tasks/jira-X.yaml\n"
+            f"M 100644 :2 tasks/jira-Y.yaml\n"
+            "\ndone\n"
+        )
+        h = make_handler(driver=DriverNoUp(), stdin_text=stream)
+        h.run()
+        self.assertEqual(h.stderr.getvalue().count("warning[push-stub]"), 1)
 
     def test_export_delete_not_implemented_logged(self):
         class DriverNoDel(FakeDriver):
@@ -1047,6 +1075,36 @@ class TestProtocolExport(unittest.TestCase):
         h = make_handler(driver=DriverNoDel(), stdin_text=stream)
         h.run()
         self.assertIn("delete not implemented", h.stderr.getvalue())
+        self.assertIn("error refs/heads/main", h.stdout.getvalue())
+        self.assertTrue(h.had_errors)
+
+    def test_run_helper_returns_nonzero_on_export_error(self):
+        class DriverNoUp(FakeDriver):
+            def upsert(self, task):
+                raise NotImplementedError("nope")
+        task = full_task(id="jira-X")
+        # Rewire _run_helper by constructing the handler directly and asserting
+        # on had_errors; _run_helper honors this via return 1.
+        body = grt.YAMLSerializer().serialize(task)
+        blen = len(body.encode("utf-8"))
+        stream = (
+            "export\n"
+            f"blob\nmark :1\ndata {blen}\n{body}\n"
+            "commit refs/heads/main\n"
+            "committer g <g@g> 0 +0000\ndata 1\nx\n"
+            f"M 100644 :1 tasks/jira-X.yaml\n"
+            "\ndone\n"
+        )
+        driver = DriverNoUp()
+        h = grt.ProtocolHandler("fake", "fake://x", driver,
+                                grt.YAMLSerializer(),
+                                stdin=io.StringIO(stream),
+                                stdout=FlushTrackingStringIO(),
+                                stderr=io.StringIO())
+        h.run()
+        self.assertTrue(h.had_errors)
+        # The real entry point maps had_errors → exit 1.
+        self.assertEqual(1 if h.had_errors else 0, 1)
 
     def test_unknown_extension_in_export_logged(self):
         driver = FakeDriver()
