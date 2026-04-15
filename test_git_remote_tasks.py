@@ -361,6 +361,242 @@ class TestBug06YamlHyphenKeys(unittest.TestCase):
         self.assertEqual(parsed["category"]["extra-key"], "val")
 
 
+class TestCaseInsensitiveConfig(unittest.TestCase):
+    def test_get_matches_any_case(self):
+        c = grt.CaseInsensitiveConfig({"baseUrl": "x", "apiToken": "t"})
+        self.assertEqual(c.get("baseurl"), "x")
+        self.assertEqual(c.get("BASEURL"), "x")
+        self.assertEqual(c["apitoken"], "t")
+
+    def test_missing_key_returns_default(self):
+        c = grt.CaseInsensitiveConfig({"a": "1"})
+        self.assertEqual(c.get("b", "fallback"), "fallback")
+
+    def test_contains_any_case(self):
+        c = grt.CaseInsensitiveConfig({"BaseUrl": "x"})
+        self.assertIn("baseurl", c)
+        self.assertIn("BASEURL", c)
+
+    def test_read_remote_config_returns_case_insensitive(self):
+        output = (
+            "tasks-remote.foo.scheme jira\n"
+            "tasks-remote.foo.baseurl https://x\n"  # git lowercases the var
+        )
+        with mock.patch.object(grt, "_run_git_config", return_value=output):
+            cfg = grt.read_remote_config("foo")
+        self.assertIsInstance(cfg, grt.CaseInsensitiveConfig)
+        # Both camelCase and lowercase lookups succeed.
+        self.assertEqual(cfg.get("baseUrl"), "https://x")
+        self.assertEqual(cfg.get("baseurl"), "https://x")
+
+
+class TestJsonEncodedMaps(unittest.TestCase):
+    """FEAT-03 JSON-encoded form for maps whose keys git config can't accept."""
+
+    def test_subconfig_reads_json_blob(self):
+        d = grt.JiraDriver("j", "jira://x", {
+            "statusMap": '{"Yüksek": "high", "Orta": "medium"}',
+        })
+        self.assertEqual(
+            d._subconfig("statusMap"),
+            {"Yüksek": "high", "Orta": "medium"},
+        )
+
+    def test_subconfig_merges_json_and_dotted(self):
+        d = grt.JiraDriver("j", "jira://x", {
+            "statusMap": '{"A": "todo"}',
+            "statusMap.B": "done",
+        })
+        merged = d._subconfig("statusMap")
+        self.assertEqual(merged["A"], "todo")
+        self.assertEqual(merged["B"], "done")
+
+    def test_malformed_json_falls_back_to_dotted(self):
+        d = grt.JiraDriver("j", "jira://x", {
+            "statusMap": "not valid json",
+            "statusMap.B": "done",
+        })
+        self.assertEqual(d._subconfig("statusMap"), {"B": "done"})
+
+    def test_apply_status_override_reads_from_json_map(self):
+        d = grt.JiraDriver("j", "jira://x", {
+            "statusMap": '{"Ertelendi": "cancelled"}',
+        })
+        self.assertEqual(
+            d._apply_status_override("Ertelendi", "todo"),
+            "cancelled",
+        )
+
+
+class TestNotionFieldLogicalMapping(unittest.TestCase):
+    """Logical→config mapping honours git-config's variable-name rules."""
+
+    def test_due_date_logical_reads_from_due_date_config(self):
+        d = grt.NotionDriver("n", "notion://x", {
+            "databaseId": "x", "token": "t",
+            "fieldMap.dueDate": "Tarih",
+        })
+        self.assertEqual(d._prop_names()["due_date"], "Tarih")
+
+    def test_json_form_for_field_map(self):
+        d = grt.NotionDriver("n", "notion://x", {
+            "databaseId": "x", "token": "t",
+            "fieldMap": '{"dueDate": "Tarih", "priority": "Acil"}',
+        })
+        names = d._prop_names()
+        self.assertEqual(names["due_date"], "Tarih")
+        self.assertEqual(names["priority"], "Acil")
+
+
+class TestNotionSchemaAwarePush(unittest.TestCase):
+    """FEAT-08 write path adapts payload shape to column type."""
+
+    def setUp(self):
+        self.d = grt.NotionDriver("n", "notion://x", {
+            "databaseId": "abc", "token": "t",
+        })
+
+    def test_status_type_emits_status_payload(self):
+        schema = {"Konu": "title", "Status": "status"}
+        props = self.d._build_properties(
+            grt.empty_task() | {"title": "t", "status": "todo"},
+            "Konu", schema,
+        )
+        self.assertEqual(props["Status"], {"status": {"name": "To Do"}})
+
+    def test_select_type_emits_select_payload(self):
+        schema = {"Konu": "title", "Status": "select"}
+        props = self.d._build_properties(
+            grt.empty_task() | {"title": "t", "status": "todo"},
+            "Konu", schema,
+        )
+        self.assertEqual(props["Status"], {"select": {"name": "To Do"}})
+
+    def test_unknown_type_skips_rather_than_400(self):
+        schema = {"Konu": "title", "Status": "people"}
+        props = self.d._build_properties(
+            grt.empty_task() | {"title": "t", "status": "todo"},
+            "Konu", schema,
+        )
+        self.assertNotIn("Status", props)
+
+    def test_inverse_status_map_used_for_push(self):
+        """Operator's statusMap configures pull; push inverts it so the
+        database's real column options are used."""
+        d = grt.NotionDriver("n", "notion://x", {
+            "databaseId": "abc", "token": "t",
+            "statusMap": '{"Not started": "todo", "Today": "in_progress"}',
+        })
+        schema = {"Konu": "title", "Status": "status"}
+        props = d._build_properties(
+            grt.empty_task() | {"title": "t", "status": "in_progress"},
+            "Konu", schema,
+        )
+        self.assertEqual(props["Status"], {"status": {"name": "Today"}})
+
+
+class TestJiraJqlConfig(unittest.TestCase):
+    def test_default_jql_satisfies_new_endpoint(self):
+        d = grt.JiraDriver("j", "jira://x",
+                           {"baseUrl": "https://x",
+                            "email": "a", "apiToken": "t"})
+        jql = d._user_jql()
+        # The new endpoint rejects a bare ORDER BY — ensure we have a
+        # real condition.
+        self.assertIn(" IS NOT EMPTY", jql.upper())
+
+    def test_user_jql_overrides_default(self):
+        d = grt.JiraDriver("j", "jira://x", {
+            "baseUrl": "https://x", "email": "a", "apiToken": "t",
+            "jql": "assignee = currentUser() ORDER BY created DESC",
+        })
+        self.assertIn("currentUser", d._user_jql())
+
+    def test_fetch_changed_wraps_user_jql(self):
+        d = grt.JiraDriver("j", "jira://x", {
+            "baseUrl": "https://x", "email": "a", "apiToken": "t",
+            "jql": "project = MD ORDER BY created DESC",
+        })
+        urls: list[str] = []
+        def fake_get(url, headers=None):
+            urls.append(url)
+            return {"issues": [], "isLast": True}
+        with mock.patch.object(d, "_http_get", side_effect=fake_get):
+            d.fetch_changed("2026-04-15T00:00:00Z")
+        decoded = urllib.parse.unquote(urls[0])
+        self.assertIn("project = MD", decoded)
+        self.assertIn('updated >= "2026-04-15 00:00:00"', decoded)
+
+
+class TestCrossSourceRefusalAllDrivers(unittest.TestCase):
+    def test_jira_refuses_vikunja_id(self):
+        d = grt.JiraDriver("j", "https://x", {"baseUrl": "https://x",
+                                                "email": "a", "apiToken": "t"})
+        with self.assertRaises(grt.JiraPushError):
+            d.upsert(full_task(id="vikunja-42"))
+
+    def test_vikunja_refuses_jira_id(self):
+        d = grt.VikunjaDriver("v", "http://x",
+                                {"baseUrl": "http://x", "apiToken": "t"})
+        with self.assertRaises(grt.VikunjaPushError):
+            d.upsert(full_task(id="jira-PROJ-1"))
+
+    def test_mstodo_refuses_notion_id(self):
+        d = grt.MSTodoDriver("m", "msftodo://x",
+                               {"accessToken": "t"})
+        with self.assertRaises(grt.MSTodoPushError):
+            d.upsert(full_task(id="notion-abc"))
+
+    def test_notion_refuses_jira_id(self):
+        d = grt.NotionDriver("n", "notion://x",
+                               {"databaseId": "abc", "token": "t"})
+        # Avoid the network: stub the schema discover that runs before
+        # the cross-source check would fire.
+        with mock.patch.object(d, "_discover_schema", return_value={}), \
+                mock.patch.object(d, "_discover_title_prop",
+                                   return_value="Name"):
+            with self.assertRaises(grt.NotionPushError):
+                d.upsert(full_task(id="jira-PROJ-1"))
+
+    def test_unprefixed_id_goes_to_create_path(self):
+        """A task with no <scheme>- prefix is treated as a new creation,
+        not a cross-source refusal."""
+        d = grt.VikunjaDriver("v", "http://x", {
+            "baseUrl": "http://x", "apiToken": "t", "projectId": "1",
+        })
+        with mock.patch.object(d, "_http_put") as put:
+            d.upsert(full_task(id="", title="fresh"))
+        put.assert_called_once()
+
+
+class TestVikunjaEndpointFallback(unittest.TestCase):
+    def test_primary_path_used_first(self):
+        d = grt.VikunjaDriver("v", "http://x",
+                                {"baseUrl": "http://x", "apiToken": "t"})
+        calls = []
+        def fake_get(url, headers=None):
+            calls.append(url)
+            return []
+        with mock.patch.object(d, "_http_get", side_effect=fake_get):
+            d.fetch_all()
+        self.assertIn("/api/v1/tasks?", calls[0])
+        self.assertNotIn("/all", calls[0])
+
+    def test_falls_back_to_tasks_all_on_403(self):
+        d = grt.VikunjaDriver("v", "http://x",
+                                {"baseUrl": "http://x", "apiToken": "t"})
+        calls = []
+        def fake_get(url, headers=None):
+            calls.append(url)
+            if "/tasks/all" in url:
+                return []
+            raise urllib.error.HTTPError(url, 403, "no scope",
+                                          hdrs=None, fp=None)
+        with mock.patch.object(d, "_http_get", side_effect=fake_get):
+            d.fetch_all()
+        self.assertTrue(any("/tasks/all" in c for c in calls))
+
+
 class TestSafeTaskId(unittest.TestCase):
     """S2-01: path-traversal and filesystem-name guards."""
 
@@ -852,7 +1088,8 @@ class TestMappingOverrides(unittest.TestCase):
             "fieldMap.priority": "Urgency",
             "fieldMap.tags": "Labels",
             "fieldMap.description": "Notes",
-            "fieldMap.due_date": "Target",
+            # Logical 'due_date' is addressed in git-config-safe form.
+            "fieldMap.dueDate": "Target",
         })
         page = {
             "id": "p",

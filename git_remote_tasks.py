@@ -720,11 +720,63 @@ REMOTE_REQUIRED_KEYS = {
 }
 
 
-def read_remote_config(remote_name: str) -> dict:
-    """Read all `tasks-remote.<name>.*` keys into a flat dict."""
+class CaseInsensitiveConfig(dict):
+    """Dict subclass with case-insensitive key lookup.
+
+    Necessary because git lowercases the *variable* segment of every
+    config key on read (e.g. `tasks-remote.foo.baseUrl` round-trips as
+    `baseurl`), but our driver code historically used camelCase
+    lookups. This wrapper accepts either form.
+
+    Sub-keys with dots (e.g. `sync.lastFetchAt`) get the same treatment
+    on each segment so writes done by us match reads from git.
+    """
+
+    @staticmethod
+    def _norm(key: str) -> str:
+        return key.lower()
+
+    def __init__(self, base: dict | None = None):
+        super().__init__()
+        self._real_keys: dict[str, str] = {}
+        for k, v in (base or {}).items():
+            self[k] = v
+
+    def __setitem__(self, key, value):
+        norm = self._norm(key)
+        super().__setitem__(norm, value)
+        self._real_keys.setdefault(norm, key)
+
+    def __getitem__(self, key):
+        return super().__getitem__(self._norm(key))
+
+    def __contains__(self, key):
+        return super().__contains__(self._norm(key))
+
+    def get(self, key, default=None):
+        return super().get(self._norm(key), default)
+
+    def pop(self, key, *args):
+        return super().pop(self._norm(key), *args)
+
+    def setdefault(self, key, default=None):
+        norm = self._norm(key)
+        if not super().__contains__(norm):
+            super().__setitem__(norm, default)
+            self._real_keys.setdefault(norm, key)
+        return super().__getitem__(norm)
+
+
+def read_remote_config(remote_name: str) -> CaseInsensitiveConfig:
+    """Read all `tasks-remote.<name>.*` keys into a case-insensitive dict.
+
+    Git lowercases the variable segment of every key on storage, so our
+    driver must look up `baseUrl`, `baseurl`, `BASEURL` etc. as the same
+    thing — `CaseInsensitiveConfig` provides that guarantee.
+    """
     prefix = f"tasks-remote.{remote_name}."
     out = _run_git_config(["--get-regexp", re.escape(prefix) + ".*"])
-    config: dict[str, str] = {}
+    config: CaseInsensitiveConfig = CaseInsensitiveConfig()
     if not out:
         return config
     for line in out.splitlines():
@@ -950,15 +1002,38 @@ class Driver(ABC):
 
     # ---- Mapping helpers (FEAT-03) ----
     def _subconfig(self, prefix: str) -> dict:
-        """Return flat sub-keys of `self.config` that start with `<prefix>.`.
+        """Return the flat map under `<prefix>` from per-remote config.
 
-        Example: `_subconfig("statusMap")` on a config with
-        `statusMap.Triage=todo` returns `{"Triage": "todo"}`. Values
-        preserve their original casing; the caller applies case policy.
+        Two forms are supported:
+
+        1. Dotted keys: `<prefix>.<name>=<value>` per `git config`. Works
+           for ASCII alphanumeric `<name>` only because git rejects
+           anything else as a variable-name segment.
+        2. A single JSON-encoded value: `<prefix>=<json>` where the value
+           is a JSON object. Use this for arbitrary keys (Turkish names,
+           emoji, anything with `_` or `.`):
+
+               git config tasks-remote.<name>.statusMap '{"Yüksek":"high"}'
+
+        When both are present, the dotted form wins on collision so
+        narrower per-key overrides keep working alongside a bulk JSON
+        block. Comparison of the prefix is case-insensitive (matches
+        CaseInsensitiveConfig).
         """
-        pref = f"{prefix}."
-        return {k[len(pref):]: v for k, v in self.config.items()
-                if k.startswith(pref)}
+        out: dict = {}
+        json_blob = self.config.get(prefix)
+        if json_blob:
+            try:
+                parsed = json.loads(json_blob)
+                if isinstance(parsed, dict):
+                    out.update({str(k): str(v) for k, v in parsed.items()})
+            except (TypeError, ValueError):
+                pass  # malformed JSON falls through to dotted-key form
+        pref = f"{prefix}.".lower()
+        for k, v in self.config.items():
+            if k.lower().startswith(pref):
+                out[k[len(pref):]] = v
+        return out
 
     def _apply_status_override(self, upstream_value: str | None,
                                 default: str) -> str:
@@ -989,22 +1064,52 @@ class Driver(ABC):
         return lower.get(upstream_value.strip().lower(), default)
 
     def _field_name(self, logical: str, default: str) -> str:
-        """Resolve a service-side field name via `fieldMap.<logical>`."""
-        return self.config.get(f"fieldMap.{logical}", default)
+        """Resolve a service-side field name via `fieldMap.<logical>`.
+
+        Honors both the dotted-key form (`fieldMap.dueDate = Tarih`) and
+        the JSON-encoded form (`fieldMap = '{"dueDate":"Tarih"}'`) by
+        going through `_subconfig`.
+        """
+        m = self._subconfig("fieldMap")
+        # Case-insensitive on the logical key for parity with
+        # CaseInsensitiveConfig elsewhere.
+        for k, v in m.items():
+            if k.lower() == logical.lower():
+                return v
+        return default
 
     # ---- Push-side shared helpers ----
-    def _native_id(self, task_id: str) -> str | None:
-        """Strip the `<scheme>-` prefix from a unified id; None if prefix missing.
+    _CROSS_SOURCE_PREFIXES = ("jira-", "vikunja-", "msftodo-", "notion-")
 
-        Cross-source writes (e.g. editing `jira-X.yaml` in a Vikunja remote)
-        resolve to None here — callers refuse to push them and emit a
-        warning rather than silently creating a duplicate.
+    def _native_id(self, task_id: str) -> str | None:
+        """Strip the `<scheme>-` prefix from a unified id.
+
+        Returns:
+          - The native id (everything after the prefix) for an id that
+            belongs to this driver's scheme.
+          - None for an id that has no recognised scheme prefix
+            (interpreted as a brand-new task → create).
+
+        Raises a driver-specific error class — caller-supplied via
+        `_cross_source_error` — when the id explicitly belongs to a
+        DIFFERENT scheme. That's a hard refusal: we never silently
+        duplicate someone else's task into our service.
         """
         prefix = f"{self.SCHEME}-"
         if task_id.startswith(prefix):
             rest = task_id[len(prefix):]
             return rest or None
+        for foreign in self._CROSS_SOURCE_PREFIXES:
+            if foreign != prefix and task_id.startswith(foreign):
+                raise self._cross_source_error()(
+                    f"refusing to push {task_id!r} to {self.SCHEME!r} — "
+                    f"task id belongs to a different service."
+                )
         return None
+
+    def _cross_source_error(self):
+        """Driver-specific exception class for cross-source push refusal."""
+        return RuntimeError
 
 
 # ---------- Jira ------------------------------------------------------------
@@ -1066,11 +1171,17 @@ class JiraPushError(RuntimeError):
 class JiraDriver(Driver):
     SCHEME = "jira"
 
+    def _cross_source_error(self):
+        return JiraPushError
+
     def _auth_header(self) -> dict:
         email = self.config.get("email", "")
         token = self.config.get("apiToken", "")
         raw = f"{email}:{token}".encode("utf-8")
-        return {"Authorization": "Basic " + base64.b64encode(raw).decode("ascii")}
+        return {
+            "Authorization": "Basic " + base64.b64encode(raw).decode("ascii"),
+            "Accept": "application/json",
+        }
 
     def normalize(self, issue: dict) -> dict:
         t = empty_task()
@@ -1121,8 +1232,23 @@ class JiraDriver(Driver):
             t["url"] = f"{base.rstrip('/')}/browse/{key}"
         return t
 
+    # Default JQL — satisfies the new /search/jql endpoint which requires
+    # at least one condition. Operators who want a narrower view set
+    # `tasks-remote.<name>.jql` (or `jqlFilter`) in git config.
+    _DEFAULT_JQL = "created is not EMPTY ORDER BY updated DESC"
+
+    def _user_jql(self) -> str:
+        return (self.config.get("jql")
+                or self.config.get("jqlFilter")
+                or self._DEFAULT_JQL)
+
+    @staticmethod
+    def _strip_order_by(jql: str) -> str:
+        idx = jql.upper().rfind("ORDER BY")
+        return jql[:idx].rstrip() if idx >= 0 else jql
+
     def fetch_all(self) -> list[dict]:
-        return self._paginate(jql="ORDER BY updated DESC")
+        return [self.normalize(x) for x in self._paginate(jql=self._user_jql())]
 
     def fetch_changed(
         self, since: str | None
@@ -1133,12 +1259,14 @@ class JiraDriver(Driver):
         Operators who need to GC removed issues should run a periodic
         full fetch (`git config tasks-remote.<name>.sync.mode full`).
         """
+        base = self._user_jql()
         if since is None:
-            issues = self._paginate(jql="ORDER BY updated ASC")
+            issues = self._paginate(jql=base)
         else:
-            # JQL wants a 'yyyy-MM-dd HH:mm' literal, not ISO with T / Z.
             jira_ts = since.replace("T", " ").replace("Z", "").split(".")[0]
-            jql = f'updated >= "{jira_ts}" ORDER BY updated ASC'
+            base_no_order = self._strip_order_by(base)
+            jql = (f'({base_no_order}) AND updated >= "{jira_ts}" '
+                    f'ORDER BY updated ASC')
             issues = self._paginate(jql=jql)
         tasks = [self.normalize(x) for x in issues]
         return tasks, [], self._now_iso()
@@ -1163,9 +1291,18 @@ class JiraDriver(Driver):
         if self.config.get("searchEndpoint", "jql") == "legacy":
             return self._paginate_legacy(base, headers, jql)
 
+        # The new /search/jql endpoint returns only `id` unless `fields` is
+        # specified. Request every field we map in normalize() plus the
+        # epic custom field, explicitly rather than relying on `*all`.
+        fields = (
+            "summary,description,status,priority,created,updated,duedate,"
+            "labels,project,customfield_10014"
+        )
         next_token: str | None = None
         while True:
-            qs = f"jql={urllib.parse.quote(jql)}&maxResults=50"
+            qs = (f"jql={urllib.parse.quote(jql)}"
+                  f"&fields={urllib.parse.quote(fields)}"
+                  f"&maxResults=50")
             if next_token:
                 qs += f"&nextPageToken={urllib.parse.quote(next_token)}"
             url = f"{base}/rest/api/3/search/jql?{qs}"
@@ -1348,9 +1485,15 @@ class VikunjaPushError(RuntimeError):
 class VikunjaDriver(Driver):
     SCHEME = "vikunja"
 
+    def _cross_source_error(self):
+        return VikunjaPushError
+
     def _auth_header(self) -> dict:
         token = self.config.get("apiToken", "")
-        return {"Authorization": f"Token {token}"}
+        return {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
 
     def normalize(self, task: dict) -> dict:
         t = empty_task()
@@ -1407,6 +1550,11 @@ class VikunjaDriver(Driver):
         return tasks, [], self._now_iso()
 
     def _paginate(self, filter_expr: str | None) -> list[dict]:
+        """Vikunja's tokens are scope-limited. `/api/v1/tasks/all` needs the
+        `tasks.read_all` scope which not every token has; `/api/v1/tasks`
+        returns the caller-visible task list without that requirement.
+        We prefer the broader path when the token supports it.
+        """
         base = self.config.get("baseUrl") or self.url
         if not base:
             raise NotImplementedError("Vikunja baseUrl is not configured")
@@ -1414,12 +1562,22 @@ class VikunjaDriver(Driver):
         page = 1
         per_page = 50
         tasks: list[dict] = []
+        path = "/api/v1/tasks"
         while True:
-            query = f"page={page}&per_page={per_page}&sort_by=updated&order_by=desc"
+            query = f"page={page}&per_page={per_page}"
             if filter_expr is not None:
                 query += "&filter=" + urllib.parse.quote(filter_expr)
-            url = f"{base.rstrip('/')}/api/v1/tasks/all?{query}"
-            data = self._http_get(url, headers=headers)
+            url = f"{base.rstrip('/')}{path}?{query}"
+            try:
+                data = self._http_get(url, headers=headers)
+            except urllib.error.HTTPError as exc:
+                if exc.code in (400, 403, 404) and path != "/api/v1/tasks/all":
+                    # Token may only permit /tasks/all — try that once.
+                    path = "/api/v1/tasks/all"
+                    tasks.clear()
+                    page = 1
+                    continue
+                raise
             if not isinstance(data, list):
                 data = data.get("tasks", []) if isinstance(data, dict) else []
             tasks.extend(data)
@@ -1498,6 +1656,9 @@ class MSTodoPushError(RuntimeError):
 
 class MSTodoDriver(Driver):
     SCHEME = "msftodo"
+
+    def _cross_source_error(self):
+        return MSTodoPushError
 
     _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
     _MSAL_SCOPES = ("Tasks.ReadWrite",)
@@ -1672,6 +1833,9 @@ class MSTodoDriver(Driver):
         return payload
 
     def upsert(self, task: dict) -> None:
+        # Resolve the id FIRST so a cross-source push fails synchronously
+        # (no MSAL prompt, no network).
+        native = self._native_id(task.get("id") or "")
         list_id = self._list_id_for(task)
         if not list_id:
             raise MSTodoPushError(
@@ -1679,7 +1843,6 @@ class MSTodoDriver(Driver):
                 "is populated or set tasks-remote.<name>.defaultListId"
             )
         headers = self._auth_header()
-        native = self._native_id(task.get("id") or "")
         payload = self._serialize_for_push(task)
         lid = urllib.parse.quote(list_id, safe="")
         if native:
@@ -1744,6 +1907,9 @@ class NotionPushError(RuntimeError):
 class NotionDriver(Driver):
     SCHEME = "notion"
 
+    def _cross_source_error(self):
+        return NotionPushError
+
     def _auth_header(self) -> dict:
         return {
             "Authorization": f"Bearer {self.config.get('token', '')}",
@@ -1756,22 +1922,35 @@ class NotionDriver(Driver):
             return ""
         return "".join((item.get("plain_text") or "") for item in rt_list if isinstance(item, dict))
 
+    # Logical → git-config-safe variable name. Git config does not
+    # accept underscores in the variable segment, so multi-word logical
+    # fields are addressed in camelCase. A user therefore writes
+    # `fieldMap.dueDate = Tarih` (not `fieldMap.due_date`).
+    _FIELD_LOGICAL_TO_CONFIG = {
+        "status":      "status",
+        "priority":    "priority",
+        "tags":        "tags",
+        "due_date":    "dueDate",
+        "description": "description",
+        "done":        "done",
+    }
+
     def _prop_names(self) -> dict:
         """Return the service-side property names for each logical field.
 
-        Each value can be overridden via `fieldMap.<logical>` in the remote
-        config — e.g. `fieldMap.status = Column Status`. Matching against
-        the Notion payload is still case-insensitive so minor casing
-        differences don't break pulls.
+        Each value can be overridden via `fieldMap.<config>` in the remote
+        config — e.g. `fieldMap.dueDate = Tarih`. The lookup is
+        case-insensitive (CaseInsensitiveConfig) so casing of the config
+        key doesn't matter.
         """
-        return {
-            "status":      self._field_name("status", "Status"),
-            "priority":    self._field_name("priority", "Priority"),
-            "tags":        self._field_name("tags", "Tags"),
-            "due_date":    self._field_name("due_date", "Due"),
-            "description": self._field_name("description", "Description"),
-            "done":        self._field_name("done", "Done"),
-        }
+        out = {}
+        defaults = {"status": "Status", "priority": "Priority",
+                    "tags": "Tags", "due_date": "Due",
+                    "description": "Description", "done": "Done"}
+        for logical, default in defaults.items():
+            cfg_key = self._FIELD_LOGICAL_TO_CONFIG.get(logical, logical)
+            out[logical] = self._field_name(cfg_key, default)
+        return out
 
     def normalize(self, page: dict, db_title: str | None = None) -> dict:
         t = empty_task()
@@ -1856,35 +2035,59 @@ class NotionDriver(Driver):
         "low": "Low", "none": None,
     }
 
-    def _discover_title_prop(self, database_id: str, headers: dict) -> str:
-        """Return the name of the `title` column in the target database.
+    def _discover_schema(self, database_id: str, headers: dict) -> dict:
+        """Return `{column_name: column_type}` for the target database.
 
-        The title property is required when creating a page; its name
-        varies per database ("Name", "Task", ...). We cache the result
-        on the driver instance so repeated upserts in one run hit the
-        network once.
+        Notion has both `select` and the newer `status` column type, with
+        different push payload shapes. We need to know per-column to avoid
+        400s. Cached on the instance for the duration of one run.
         """
-        cached = getattr(self, "_title_prop_name", None)
-        if cached:
+        cached = getattr(self, "_schema_cache", None)
+        if cached is not None:
             return cached
         data = self._http_get(
             f"{self._NOTION_BASE}/databases/{database_id}",
             headers=headers,
         )
+        schema: dict[str, str] = {}
         for name, prop in (data.get("properties") or {}).items():
-            if isinstance(prop, dict) and prop.get("type") == "title":
-                self._title_prop_name = name
+            if isinstance(prop, dict):
+                schema[name] = prop.get("type") or ""
+        self._schema_cache = schema
+        return schema
+
+    def _discover_title_prop(self, database_id: str, headers: dict) -> str:
+        schema = self._discover_schema(database_id, headers)
+        for name, ptype in schema.items():
+            if ptype == "title":
                 return name
         raise NotionPushError(
             f"Notion database {database_id} has no title property"
         )
 
-    def _build_properties(self, task: dict, title_prop: str) -> dict:
+    def _invert_map(self, prefix: str) -> dict[str, str]:
+        """Return `{unified: upstream}` from a user-configured map.
+
+        Used on push so a database whose Status column reads
+        ('Not started', 'Today', 'Done') round-trips through statusMap
+        entries the operator already configured for pull, instead of us
+        guessing a universal vocabulary that doesn't exist on the column.
+        """
+        out: dict[str, str] = {}
+        for upstream, unified in self._subconfig(prefix).items():
+            out.setdefault(unified, upstream)
+        return out
+
+    def _build_properties(self, task: dict, title_prop: str,
+                           schema: dict) -> dict:
         """Render a unified task into Notion's properties shape.
 
         Service-side column names come from `_prop_names()` so push and
         pull use the same `fieldMap.*` overrides — no risk of writing to
-        "Status" while reading from "State".
+        "Status" while reading from "State". Each column's payload shape
+        is chosen from the discovered schema (status vs select vs
+        multi_select etc.) so we don't 400 on database-specific
+        configuration.
         """
         names = self._prop_names()
         props: dict = {
@@ -1893,20 +2096,42 @@ class NotionDriver(Driver):
                             "text": {"content": task.get("title") or ""}}]
             }
         }
-        status = self._STATUS_TO_NOTION.get(task.get("status") or "todo")
+
+        def _select_payload(col: str, value: str) -> dict | None:
+            ptype = schema.get(col, "select")
+            if ptype == "status":
+                return {"status": {"name": value}}
+            if ptype == "select":
+                return {"select": {"name": value}}
+            return None  # column missing or wrong type — skip rather than 400
+
+        # Prefer the inverse of the user's statusMap / priorityMap when
+        # present — Notion column options are database-specific, so the
+        # configured pull mapping is the authoritative source for push.
+        status_inv = self._invert_map("statusMap")
+        priority_inv = self._invert_map("priorityMap")
+        status_unified = task.get("status") or "todo"
+        status = status_inv.get(status_unified) \
+                  or self._STATUS_TO_NOTION.get(status_unified)
         if status:
-            props[names["status"]] = {"select": {"name": status}}
-        pri = self._PRIORITY_TO_NOTION.get(task.get("priority") or "none")
+            payload = _select_payload(names["status"], status)
+            if payload:
+                props[names["status"]] = payload
+        pri_unified = task.get("priority") or "none"
+        pri = priority_inv.get(pri_unified) \
+              or self._PRIORITY_TO_NOTION.get(pri_unified)
         if pri:
-            props[names["priority"]] = {"select": {"name": pri}}
-        if task.get("tags"):
+            payload = _select_payload(names["priority"], pri)
+            if payload:
+                props[names["priority"]] = payload
+        if task.get("tags") and schema.get(names["tags"]) == "multi_select":
             props[names["tags"]] = {
                 "multi_select": [{"name": t} for t in task["tags"]]
             }
-        if task.get("due_date"):
+        if task.get("due_date") and schema.get(names["due_date"]) == "date":
             props[names["due_date"]] = {"date": {"start": task["due_date"]}}
         desc = task.get("description")
-        if desc:
+        if desc and schema.get(names["description"]) == "rich_text":
             props[names["description"]] = {
                 "rich_text": [{"type": "text",
                                 "text": {"content": desc}}]
@@ -1917,11 +2142,14 @@ class NotionDriver(Driver):
         database_id = self.config.get("databaseId")
         if not database_id:
             raise NotionPushError("Notion databaseId is not configured")
+        # Validate the id (raises on cross-source) BEFORE doing any
+        # network IO so a refused push is a synchronous failure.
+        native = self._native_id(task.get("id") or "")
         headers = self._auth_header()
         headers["Content-Type"] = "application/json"
+        schema = self._discover_schema(database_id, headers)
         title_prop = self._discover_title_prop(database_id, headers)
-        props = self._build_properties(task, title_prop)
-        native = self._native_id(task.get("id") or "")
+        props = self._build_properties(task, title_prop, schema)
         if native:
             # Update existing page. Notion PATCH on /pages/{id} expects
             # { "properties": {...} } and optionally { "archived": false }.
