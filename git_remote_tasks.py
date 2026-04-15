@@ -51,6 +51,31 @@ except ImportError:  # pragma: no cover - environment dependent
     MSAL_AVAILABLE = False
 
 
+# Intentional public API of this module. Anything not listed is an
+# implementation detail and may move without notice.
+__all__ = [
+    "__version__",
+    # Unified schema
+    "TASK_FIELDS", "STATUSES", "PRIORITIES", "CATEGORY_TYPES",
+    "empty_task", "normalize_task", "is_safe_task_id",
+    # Serializers
+    "Serializer", "YAMLSerializer", "OrgSerializer",
+    "serializer_for_format", "serializer_for_extension",
+    # Config
+    "CaseInsensitiveConfig",
+    "read_format", "read_remote_config",
+    "write_config_value", "unset_config_values",
+    # Drivers
+    "Driver", "JiraDriver", "VikunjaDriver", "MSTodoDriver", "NotionDriver",
+    "SCHEMES", "REMOTE_REQUIRED_KEYS", "driver_for_scheme",
+    "JiraPushError", "JiraConfigError",
+    "VikunjaPushError", "VikunjaConfigError",
+    "MSTodoPushError", "NotionPushError",
+    # Protocol + entry point
+    "ProtocolHandler", "main",
+]
+
+
 # ============================================================================
 # Unified schema
 # ============================================================================
