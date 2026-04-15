@@ -495,13 +495,68 @@ class TestJiraDriver(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             d.fetch_all()
 
-    def test_upsert_not_implemented(self):
-        with self.assertRaises(NotImplementedError):
-            self.d.upsert({})
+    def test_upsert_updates_existing_issue(self):
+        put_calls = []
+        def fake_put(url, body=None, headers=None):
+            put_calls.append((url, body))
+            return {}
+        # Return one transition matching 'In Progress'.
+        def fake_get(url, headers=None):
+            return {"transitions": [{"id": "11",
+                                      "to": {"name": "In Progress"}}]}
+        post_calls = []
+        def fake_post(url, body=None, headers=None):
+            post_calls.append((url, body))
+            return {}
+        task = full_task(id="jira-PROJ-1", status="in_progress", title="t")
+        with mock.patch.object(self.d, "_http_put", side_effect=fake_put), \
+                mock.patch.object(self.d, "_http_get", side_effect=fake_get), \
+                mock.patch.object(self.d, "_http_post", side_effect=fake_post):
+            self.d.upsert(task)
+        self.assertTrue(put_calls[0][0].endswith("/rest/api/3/issue/PROJ-1"))
+        self.assertEqual(post_calls[0][1]["transition"]["id"], "11")
 
-    def test_delete_not_implemented(self):
-        with self.assertRaises(NotImplementedError):
+    def test_upsert_creates_new_issue_requires_project_key(self):
+        task = full_task(id="", status="todo", title="new")
+        with self.assertRaises(grt.JiraPushError):
+            self.d.upsert(task)
+
+    def test_upsert_creates_new_issue_when_project_key_present(self):
+        self.d.config["projectKey"] = "PROJ"
+        calls = []
+        def fake_post(url, body=None, headers=None):
+            calls.append((url, body))
+            return {"key": "PROJ-2"}
+        task = full_task(id="", title="new task")
+        with mock.patch.object(self.d, "_http_post", side_effect=fake_post):
+            self.d.upsert(task)
+        url, body = calls[0]
+        self.assertTrue(url.endswith("/rest/api/3/issue"))
+        self.assertEqual(body["fields"]["project"]["key"], "PROJ")
+        self.assertEqual(body["fields"]["issuetype"]["name"], "Task")
+
+    def test_upsert_raises_when_transition_missing(self):
+        def fake_get(url, headers=None):
+            return {"transitions": []}
+        with mock.patch.object(self.d, "_http_put", return_value={}), \
+                mock.patch.object(self.d, "_http_get", side_effect=fake_get), \
+                mock.patch.object(self.d, "_http_post", return_value={}):
+            with self.assertRaises(grt.JiraPushError):
+                self.d.upsert(full_task(id="jira-PROJ-1", status="done"))
+
+    def test_upsert_refuses_cross_source(self):
+        with self.assertRaises(grt.JiraPushError):
+            self.d.upsert(full_task(id="vikunja-42"))
+
+    def test_delete_calls_api(self):
+        with mock.patch.object(self.d, "_http_delete") as d:
             self.d.delete("jira-PROJ-1")
+            d.assert_called_once()
+            self.assertTrue(d.call_args[0][0].endswith("/rest/api/3/issue/PROJ-1"))
+
+    def test_delete_refuses_cross_source(self):
+        with self.assertRaises(grt.JiraPushError):
+            self.d.delete("vikunja-42")
 
 
 # ---------------------------------------------------------------------------

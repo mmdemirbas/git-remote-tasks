@@ -937,6 +937,130 @@ class JiraDriver(Driver):
                 break
         return issues
 
+    # ---- Push ----
+    _STATUS_TO_JIRA_TRANSITION = {
+        "todo": "To Do",
+        "in_progress": "In Progress",
+        "done": "Done",
+        "cancelled": "Cancelled",
+    }
+    _PRIORITY_TO_JIRA = {
+        "critical": "Highest", "high": "High", "medium": "Medium",
+        "low": "Low", "none": None,
+    }
+
+    def _base_url(self) -> str:
+        base = self.config.get("baseUrl") or self.url
+        if not base:
+            raise JiraConfigError("Jira baseUrl is not configured")
+        return base.rstrip("/")
+
+    def _serialize_for_push(self, task: dict) -> dict:
+        """Map unified task → Jira /issue fields payload (edit-shape).
+
+        Description uses ADF document-of-a-single-paragraph for multi-line
+        support; single-line descriptions still ride the same wrapper.
+        """
+        fields: dict = {}
+        if task.get("title"):
+            fields["summary"] = task["title"]
+        desc = task.get("description")
+        if desc:
+            fields["description"] = {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {"type": "paragraph",
+                     "content": [{"type": "text", "text": line}]}
+                    for line in desc.split("\n") if line != "" or True
+                ],
+            }
+        pri = self._PRIORITY_TO_JIRA.get(task.get("priority") or "none")
+        if pri:
+            fields["priority"] = {"name": pri}
+        if task.get("due_date"):
+            fields["duedate"] = (task["due_date"].split("T")[0]
+                                  if "T" in task["due_date"]
+                                  else task["due_date"])
+        if task.get("tags") is not None:
+            fields["labels"] = list(task["tags"])
+        return fields
+
+    def _project_key(self) -> str | None:
+        """Return the Jira project key used for create; prefer explicit config."""
+        return self.config.get("projectKey")
+
+    def upsert(self, task: dict) -> None:
+        base = self._base_url()
+        headers = self._auth_header()
+        headers.setdefault("Accept", "application/json")
+        native = self._native_id(task.get("id") or "")
+        fields = self._serialize_for_push(task)
+        if native:
+            # Update existing issue.
+            self._http_put(f"{base}/rest/api/3/issue/{native}",
+                            body={"fields": fields}, headers=headers)
+            # Status is a transition, not a field edit.
+            self._transition(base, native, task.get("status"), headers)
+            return
+        # Create.
+        project = self._project_key()
+        if not project:
+            raise JiraPushError(
+                "projectKey is required to create new Jira issues; "
+                "set tasks-remote.<name>.projectKey"
+            )
+        fields["project"] = {"key": project}
+        fields.setdefault("issuetype", {"name": "Task"})
+        self._http_post(f"{base}/rest/api/3/issue",
+                         body={"fields": fields}, headers=headers)
+
+    def _transition(self, base: str, key: str, status: str | None,
+                    headers: dict) -> None:
+        if not status:
+            return
+        target_name = self._STATUS_TO_JIRA_TRANSITION.get(status)
+        if not target_name:
+            return
+        # Look up available transitions; Jira requires an id, not a name.
+        trans = self._http_get(
+            f"{base}/rest/api/3/issue/{key}/transitions",
+            headers=headers,
+        ).get("transitions") or []
+        for t in trans:
+            tname = ((t.get("to") or {}).get("name")
+                      or t.get("name") or "").strip()
+            if tname.lower() == target_name.lower():
+                self._http_post(
+                    f"{base}/rest/api/3/issue/{key}/transitions",
+                    body={"transition": {"id": t.get("id")}},
+                    headers=headers,
+                )
+                return
+        # Transition not offered for this issue's workflow — not an error,
+        # but worth noting in the helper log so the operator can diagnose.
+        raise JiraPushError(
+            f"no Jira transition to {target_name!r} available for {key}"
+        )
+
+    def delete(self, task_id: str) -> None:
+        base = self._base_url()
+        native = self._native_id(task_id)
+        if not native:
+            raise JiraPushError(
+                f"cannot delete {task_id!r}: not a Jira-sourced id"
+            )
+        self._http_delete(f"{base}/rest/api/3/issue/{native}",
+                           headers=self._auth_header())
+
+
+class JiraConfigError(RuntimeError):
+    """Missing or invalid Jira driver configuration."""
+
+
+class JiraPushError(RuntimeError):
+    """Raised when a push is rejected before or by Jira."""
+
 
 # ---------- Vikunja ---------------------------------------------------------
 
