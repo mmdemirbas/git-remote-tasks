@@ -1774,6 +1774,33 @@ class MSTodoDriver(Driver):
         return t
 
     def fetch_all(self) -> list[dict]:
+        changed, _, _ = self._fetch_with_optional_delta(use_delta=False)
+        return changed
+
+    def fetch_changed(
+        self, since: str | None
+    ) -> tuple[list[dict], list[str], str | None]:
+        """Incremental fetch via Graph delta query.
+
+        FEAT-06b. Graph's `/me/todo/lists/{id}/tasks/delta` returns a
+        `@odata.deltaLink` URL that, when followed on the next run,
+        returns only tasks that changed since the previous link was
+        issued. Removed tasks come back as objects with `@removed`
+        annotation — we emit those as `D` directives.
+
+        State is persisted as one git config key per list:
+
+            tasks-remote.<name>.sync.deltaLink.<listId> = <opaque-url>
+
+        On `since=None` (first fetch) we also use delta so that the
+        next call has a token; this matches Microsoft's recommendation
+        to seed with a delta call rather than a plain GET.
+        """
+        return self._fetch_with_optional_delta(use_delta=True)
+
+    def _fetch_with_optional_delta(
+        self, use_delta: bool,
+    ) -> tuple[list[dict], list[str], str | None]:
         if not MSAL_AVAILABLE and not self.config.get("accessToken"):
             raise NotImplementedError(
                 "MS Todo requires MSAL device-code auth or a preconfigured accessToken"
@@ -1781,16 +1808,81 @@ class MSTodoDriver(Driver):
         headers = self._auth_header()
         lists_url = f"{self._GRAPH_BASE}/me/todo/lists"
         lists = self._http_get(lists_url, headers=headers).get("value", [])
-        out: list[dict] = []
+        changed: list[dict] = []
+        deleted_ids: list[str] = []
         for lst in lists:
-            lid = lst.get("id")
+            lid = lst.get("id") or ""
             lname = lst.get("displayName")
-            tasks = self._http_get(
-                f"{self._GRAPH_BASE}/me/todo/lists/{lid}/tasks",
-                headers=headers,
-            ).get("value", [])
-            out.extend(self.normalize(t, list_name=lname) for t in tasks)
-        return out
+            if not lid:
+                continue
+            page_url, link_key = self._delta_starting_url(lid, use_delta)
+            new_link = self._consume_delta_pages(
+                page_url, headers, lname, lid, changed, deleted_ids,
+                use_delta=use_delta,
+            )
+            if use_delta and new_link:
+                self._persist_delta_link(link_key, new_link)
+        return changed, deleted_ids, self._now_iso()
+
+    def _delta_starting_url(self, list_id: str,
+                             use_delta: bool) -> tuple[str, str]:
+        """Return (url, config-key-for-deltalink) for `list_id`.
+
+        Persisted delta links are stored case-insensitively under
+        `sync.deltaLink.<listId-sanitized>`. The list id is base64-ish
+        and may contain `=` / `_` which git config rejects in variable
+        names, so we hex-encode for the key form.
+        """
+        list_safe = list_id.encode("utf-8").hex()
+        key = f"sync.deltaLink.{list_safe}"
+        stored = self.config.get(key) if use_delta else None
+        if stored:
+            return stored, key
+        if use_delta:
+            return (
+                f"{self._GRAPH_BASE}/me/todo/lists/"
+                f"{urllib.parse.quote(list_id, safe='')}/tasks/delta",
+                key,
+            )
+        return (
+            f"{self._GRAPH_BASE}/me/todo/lists/"
+            f"{urllib.parse.quote(list_id, safe='')}/tasks",
+            key,
+        )
+
+    def _consume_delta_pages(self, url: str, headers: dict,
+                              list_name: str | None, list_id: str,
+                              changed: list[dict], deleted_ids: list[str],
+                              use_delta: bool) -> str | None:
+        """Walk `@odata.nextLink`s and collect changed + removed tasks.
+
+        Returns the final `@odata.deltaLink` (only present on the last
+        page of a delta sequence) so the caller can persist it for the
+        next run. Plain non-delta fetches return None.
+        """
+        last_delta_link: str | None = None
+        while url:
+            data = self._http_get(url, headers=headers)
+            for raw in data.get("value", []):
+                if raw.get("@removed"):
+                    rid = raw.get("id")
+                    if rid:
+                        deleted_ids.append(f"mstodo-{rid}")
+                    continue
+                changed.append(self.normalize(raw, list_name=list_name))
+            url = data.get("@odata.nextLink") or ""
+            link = data.get("@odata.deltaLink")
+            if link:
+                last_delta_link = link
+        return last_delta_link
+
+    def _persist_delta_link(self, key: str, value: str) -> None:
+        config_key = f"tasks-remote.{self.remote_name}.{key}"
+        if not write_config_value(config_key, value):
+            return
+        # Reflect the live update so a subsequent call in the same run
+        # picks the persisted link.
+        self.config[key] = value
 
     # ---- Push ----
     _STATUS_TO_MSTODO = {
@@ -2004,25 +2096,72 @@ class NotionDriver(Driver):
         return t
 
     def fetch_all(self) -> list[dict]:
+        changed, _, _ = self._query_pages(since=None,
+                                            include_archived=False)
+        return changed
+
+    def fetch_changed(
+        self, since: str | None,
+    ) -> tuple[list[dict], list[str], str | None]:
+        """Incremental fetch via Notion `last_edited_time` filter.
+
+        FEAT-06c. The query body is:
+
+            {"filter":
+              {"timestamp": "last_edited_time",
+               "last_edited_time": {"on_or_after": "<iso>"}},
+             "sorts": [{"timestamp": "last_edited_time",
+                         "direction": "ascending"}]}
+
+        Notion returns ARCHIVED pages too when `archived` filter is
+        omitted; we promote those into `deleted_ids` so a `git rm`
+        equivalent flows back into the local tree.
+
+        Setting `since=None` falls back to a full fetch and returns the
+        current timestamp as the next-since token.
+        """
+        return self._query_pages(since=since, include_archived=True)
+
+    def _query_pages(self, since: str | None, include_archived: bool,
+                      ) -> tuple[list[dict], list[str], str | None]:
         database_id = self.config.get("databaseId")
         if not database_id:
             raise NotImplementedError("Notion databaseId is not configured")
         headers = self._auth_header()
-        url = f"https://api.notion.com/v1/databases/{database_id}/query"
-        results: list[dict] = []
-        cursor = None
+        url = f"{self._NOTION_BASE}/databases/{database_id}/query"
+        changed: list[dict] = []
+        deleted_ids: list[str] = []
+        cursor: str | None = None
         db_title = self.config.get("databaseTitle")
         while True:
             body: dict = {}
             if cursor:
                 body["start_cursor"] = cursor
+            if since:
+                body["filter"] = {
+                    "timestamp": "last_edited_time",
+                    "last_edited_time": {"on_or_after": since},
+                }
+                body["sorts"] = [{
+                    "timestamp": "last_edited_time",
+                    "direction": "ascending",
+                }]
             data = self._http_post(url, body=body, headers=headers)
             for page in data.get("results", []):
-                results.append(self.normalize(page, db_title=db_title))
+                pid = page.get("id") or ""
+                if page.get("archived"):
+                    # Archived pages are hidden in the Notion UI; never
+                    # surface them as live tasks. Only the incremental
+                    # path promotes them into deleted_ids so a `git rm`
+                    # equivalent flows back into the local tree.
+                    if include_archived and pid:
+                        deleted_ids.append(f"notion-{pid}")
+                    continue
+                changed.append(self.normalize(page, db_title=db_title))
             if not data.get("has_more"):
                 break
             cursor = data.get("next_cursor")
-        return results
+        return changed, deleted_ids, self._now_iso()
 
     # ---- Push ----
     _NOTION_BASE = "https://api.notion.com/v1"

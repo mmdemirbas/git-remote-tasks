@@ -569,6 +569,197 @@ class TestCrossSourceRefusalAllDrivers(unittest.TestCase):
         put.assert_called_once()
 
 
+class TestMSTodoIncrementalDelta(unittest.TestCase):
+    """FEAT-06b: Graph delta query for MS Todo."""
+
+    def setUp(self):
+        self.d = grt.MSTodoDriver("mstodo", "mstodo://consumers",
+                                    {"accessToken": "tok"})
+
+    def _lists_response(self, *items):
+        return {"value": [{"id": i, "displayName": n} for i, n in items]}
+
+    def test_first_fetch_uses_delta_endpoint_and_persists_link(self):
+        responses = [
+            self._lists_response(("L1", "Inbox")),
+            {
+                "value": [{"id": "T1", "title": "first",
+                            "status": "notStarted"}],
+                "@odata.deltaLink":
+                    "https://graph.microsoft.com/v1.0/me/todo/lists/L1/tasks/delta?token=AAA",
+            },
+        ]
+        with mock.patch.object(self.d, "_http_get", side_effect=responses), \
+                mock.patch.object(grt, "write_config_value",
+                                   return_value=True) as w:
+            changed, deleted, since = self.d.fetch_changed(None)
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(deleted, [])
+        self.assertEqual(w.call_count, 1)
+        key, val = w.call_args[0]
+        self.assertIn("sync.deltaLink.", key)
+        self.assertIn("token=AAA", val)
+
+    def test_subsequent_fetch_uses_stored_delta_link(self):
+        list_hex = "L1".encode("utf-8").hex()
+        self.d.config[f"sync.deltaLink.{list_hex}"] = (
+            "https://graph.microsoft.com/v1.0/delta-link-stored")
+        called: list[str] = []
+        def fake_get(url, headers=None):
+            called.append(url)
+            if "/lists" in url and "/tasks" not in url:
+                return self._lists_response(("L1", "Inbox"))
+            return {"value": [],
+                     "@odata.deltaLink": "https://example.com/next-link"}
+        with mock.patch.object(self.d, "_http_get", side_effect=fake_get), \
+                mock.patch.object(grt, "write_config_value",
+                                   return_value=True):
+            self.d.fetch_changed("ignored")
+        self.assertIn("https://graph.microsoft.com/v1.0/delta-link-stored",
+                       called)
+
+    def test_removed_tombstone_becomes_deleted_id(self):
+        responses = [
+            self._lists_response(("L1", "Inbox")),
+            {
+                "value": [
+                    {"id": "T-DEAD", "@removed": {"reason": "deleted"}},
+                    {"id": "T-LIVE", "title": "still here"},
+                ],
+                "@odata.deltaLink": "https://example.com/next",
+            },
+        ]
+        with mock.patch.object(self.d, "_http_get", side_effect=responses), \
+                mock.patch.object(grt, "write_config_value",
+                                   return_value=True):
+            changed, deleted, _ = self.d.fetch_changed(None)
+        self.assertEqual(deleted, ["mstodo-T-DEAD"])
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(changed[0]["id"], "mstodo-T-LIVE")
+
+    def test_pagination_via_odata_next_link(self):
+        responses = [
+            self._lists_response(("L1", "Inbox")),
+            {"value": [{"id": "T1", "title": "one"}],
+             "@odata.nextLink": "https://example.com/page2"},
+            {"value": [{"id": "T2", "title": "two"}],
+             "@odata.deltaLink": "https://example.com/delta-final"},
+        ]
+        with mock.patch.object(self.d, "_http_get", side_effect=responses), \
+                mock.patch.object(grt, "write_config_value",
+                                   return_value=True):
+            changed, _, _ = self.d.fetch_changed(None)
+        self.assertEqual([t["id"] for t in changed],
+                          ["mstodo-T1", "mstodo-T2"])
+
+    def test_fetch_all_does_not_persist_delta_link(self):
+        responses = [
+            self._lists_response(("L1", "Inbox")),
+            {"value": [{"id": "T1", "title": "x"}]},
+        ]
+        with mock.patch.object(self.d, "_http_get", side_effect=responses), \
+                mock.patch.object(grt, "write_config_value") as w:
+            self.d.fetch_all()
+        w.assert_not_called()
+
+    def test_fetch_changed_requires_auth(self):
+        d = grt.MSTodoDriver("mstodo", "mstodo://consumers", {})
+        with mock.patch.object(grt, "MSAL_AVAILABLE", False):
+            with self.assertRaises(NotImplementedError):
+                d.fetch_changed(None)
+
+    def test_lists_with_empty_id_skipped(self):
+        responses = [{"value": [{"id": "", "displayName": "ghost"},
+                                  {"id": "L1", "displayName": "real"}]},
+                     {"value": [], "@odata.deltaLink": "https://x/d"}]
+        with mock.patch.object(self.d, "_http_get", side_effect=responses), \
+                mock.patch.object(grt, "write_config_value",
+                                   return_value=True):
+            changed, deleted, _ = self.d.fetch_changed(None)
+        self.assertEqual(changed, [])
+        self.assertEqual(deleted, [])
+
+
+class TestNotionIncremental(unittest.TestCase):
+    """FEAT-06c: last_edited_time filter for Notion."""
+
+    def setUp(self):
+        self.d = grt.NotionDriver("notion", "notion://x",
+                                    {"databaseId": "abc", "token": "t"})
+
+    def test_since_emits_last_edited_time_filter(self):
+        captured: list[dict] = []
+        def fake_post(url, body=None, headers=None):
+            captured.append(body or {})
+            return {"results": [], "has_more": False}
+        with mock.patch.object(self.d, "_http_post", side_effect=fake_post):
+            self.d.fetch_changed("2026-04-15T00:00:00Z")
+        self.assertEqual(len(captured), 1)
+        body = captured[0]
+        self.assertEqual(body["filter"]["timestamp"], "last_edited_time")
+        self.assertEqual(body["filter"]["last_edited_time"],
+                          {"on_or_after": "2026-04-15T00:00:00Z"})
+        self.assertEqual(body["sorts"][0]["direction"], "ascending")
+
+    def test_archived_pages_become_deleted_ids(self):
+        def fake_post(url, body=None, headers=None):
+            return {"results": [
+                {"id": "p1", "archived": True, "properties": {}},
+                {"id": "p2", "archived": False, "properties": {}},
+            ], "has_more": False}
+        with mock.patch.object(self.d, "_http_post", side_effect=fake_post):
+            changed, deleted, _ = self.d.fetch_changed("2026-04-15T00:00:00Z")
+        self.assertEqual(deleted, ["notion-p1"])
+        self.assertEqual([t["id"] for t in changed], ["notion-p2"])
+
+    def test_fetch_all_does_not_filter_or_emit_deletes(self):
+        captured: list[dict] = []
+        def fake_post(url, body=None, headers=None):
+            captured.append(body or {})
+            return {"results": [
+                # Even an archived page should not flow as a delete on
+                # the full snapshot path — it's just absent from the
+                # tree the next deleteall rebuilds.
+                {"id": "p1", "archived": True, "properties": {}},
+            ], "has_more": False}
+        with mock.patch.object(self.d, "_http_post", side_effect=fake_post):
+            tasks = self.d.fetch_all()
+        self.assertNotIn("filter", captured[0])
+        self.assertNotIn("sorts", captured[0])
+        # fetch_all returns ONLY changed (legacy contract); archived
+        # pages are filtered into deleted_ids on fetch_changed only.
+        self.assertEqual(tasks, [])
+
+    def test_since_none_falls_back_to_unfiltered(self):
+        captured: list[dict] = []
+        def fake_post(url, body=None, headers=None):
+            captured.append(body or {})
+            return {"results": [], "has_more": False}
+        with mock.patch.object(self.d, "_http_post", side_effect=fake_post):
+            self.d.fetch_changed(None)
+        self.assertNotIn("filter", captured[0])
+
+    def test_pagination_carries_filter_each_page(self):
+        captured: list[dict] = []
+        def fake_post(url, body=None, headers=None):
+            captured.append(body or {})
+            if len(captured) == 1:
+                return {"results": [{"id": "p1", "properties": {}}],
+                         "has_more": True, "next_cursor": "c2"}
+            return {"results": [{"id": "p2", "properties": {}}],
+                     "has_more": False}
+        with mock.patch.object(self.d, "_http_post", side_effect=fake_post):
+            self.d.fetch_changed("2026-04-15T00:00:00Z")
+        self.assertEqual(len(captured), 2)
+        for body in captured:
+            self.assertIn("filter", body)
+
+    def test_no_database_id_raises(self):
+        d = grt.NotionDriver("n", "notion://x", {"token": "t"})
+        with self.assertRaises(NotImplementedError):
+            d.fetch_changed("2026-04-15T00:00:00Z")
+
+
 class TestVikunjaEndpointFallback(unittest.TestCase):
     def test_primary_path_used_first(self):
         d = grt.VikunjaDriver("v", "http://x",
