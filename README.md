@@ -433,6 +433,42 @@ ever happens on the current version, set
 `tasks-remote.<name>.deviceFlowTimeout` to a value (in seconds) larger
 than however long you take to enter the code in the browser.
 
+**Every MS Todo fetch re-downloads everything / spams `invalid key: ...deltaLink...`**
+Old version. Delta-link config keys used to start with a digit, which
+git config refuses. Every write failed silently, so the next fetch had
+no cursor to resume from. Re-install from this repo and run
+`git fetch mstodo` once to repopulate the (correctly-named) delta
+links — subsequent fetches will be delta-only.
+
+**MS Todo `git fetch` lingers a few seconds after browser approval**
+MSAL's device-code poll loop sleeps up to the AAD-provided `interval`
+(typically 5s) between polls. That sleep is inside the MSAL library
+and we can't shorten it without patching MSAL. Once the first run
+persists a refresh token, later fetches skip the device flow entirely
+and start instantly.
+
+**Only one remote's files show up in `tasks/`**
+Each remote fetches to its own tracking ref (`refs/remotes/<name>/main`);
+the working tree only contains what you have merged. To see a remote's
+tasks without merging, read the ref directly:
+
+```bash
+git ls-tree refs/remotes/jira/main -- tasks/ | head
+git show refs/remotes/jira/main:tasks/jira-PROJ-42.yaml
+```
+
+To materialize them all in one working tree, merge each remote once
+with `--allow-unrelated-histories`:
+
+```bash
+git merge jira/main   --allow-unrelated-histories
+git merge mstodo/main --allow-unrelated-histories
+git merge notion/main --allow-unrelated-histories
+```
+
+Ids are prefixed per source (`jira-PROJ-42`, `mstodo-AQM…`,
+`notion-<uuid>`, `vikunja-7`), so file names never collide.
+
 **First fetch takes a long time on a large project**
 The full snapshot paginates sequentially: 7000+ tasks at 100 per page
 is ~70 round-trips. Only the first fetch is full; later fetches are

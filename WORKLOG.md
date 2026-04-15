@@ -1,5 +1,68 @@
 # Work log
 
+## 2026-04-15 — MS Todo deltaLink corruption + task-id regex + fetch feedback
+
+Three issues reported against the second round of live MS Todo fetches.
+
+### Bug A — delta links were never persisted
+
+Every MS Todo fetch spammed stderr with lines like
+
+```
+git-remote-tasks: git config: error: invalid key:
+  tasks-remote.mstodo.sync.deltaLink.41514d6b41444177...
+```
+
+Root cause: git config variable names must start with a letter, but the
+hex-encoded list id starts with a digit (`41...`) in essentially every
+real-world case. Every write to the delta-link key failed silently.
+With no persisted delta link, every subsequent fetch re-ran the full
+`/tasks/delta?token=...` flow from scratch on every list — ~43s for
+the user's account.
+
+Fix: use `-` as the final joiner (so the variable name is
+`deltaLink-<hex>`, starting with `d`), and also prefix the hex with
+`l` for defence in depth. Keys look like
+`tasks-remote.<name>.sync.deltaLink-l41514d6b...`. Live verified: the
+writes succeed, the second fetch finishes in 6s and walks each list's
+persisted delta cursor.
+
+### Bug B — MS Todo task ids ending in `=` dropped on the floor
+
+Every task with a base64-padded id surfaced as
+`warning[unsafe-id]: skipping task ... must match
+[A-Za-z0-9][A-Za-z0-9._-]* (≤255 chars).`. The regex didn't allow `=`.
+`=` is safe in filenames and is neither a traversal nor a
+shell-metachar; rejecting it just silently omits real tasks. Added `=`
+to the allowed set.
+
+### Feature — per-fetch stderr summary
+
+Git prints `* [new branch] main -> <remote>/main` on success but
+doesn't say how much work was done, so "incremental found nothing" is
+indistinguishable from "something swallowed the output". Added a
+one-line stderr report per `import` batch:
+
+- Full: `<remote>: fetched <n> tasks (full snapshot)`
+- Empty incremental: `<remote>: up to date since <ts>`
+- Non-empty incremental: `<remote>: <n> changed, <m> deleted since <ts>`
+
+### Known limitation (not fixed)
+
+After the user approves the device code in the browser, MSAL's poll
+loop still sleeps up to `interval` seconds (default 5s) before its
+next poll, so `git fetch mstodo` can linger for a few seconds after
+the browser step completes. That sleep is inside MSAL and we can't
+shorten it without patching the library.
+
+### Tests — 348 → 352, all green
+- `test_base64_padding_equals_allowed` — the `=` fix.
+- Updated `TestMSTodoIncrementalDelta` pair to pin the new key shape
+  (`sync.deltaLink-l<hex>`, no `sync.deltaLink.<hex>`).
+- `test_fetch_prints_summary_on_full_snapshot`
+- `test_fetch_prints_summary_on_empty_incremental`
+- `test_fetch_prints_summary_on_non_empty_incremental`
+
 ## 2026-04-15 — Fetch hang on empty deltas + MSAL device-code never authorizes
 
 Two unrelated bugs surfaced from continued live use after the page-size
