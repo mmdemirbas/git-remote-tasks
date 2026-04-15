@@ -151,6 +151,7 @@ Per-remote (`tasks-remote.<name>.*`):
 | `clientId`      | mstodo        | Registered Azure AD client ID.             |
 | `accessToken`   | mstodo        | Pre-acquired bearer token (bypasses MSAL). |
 | `defaultListId` | mstodo        | List id for CREATE + DELETE.               |
+| `deviceFlowTimeout` | mstodo    | Max seconds to wait for device-code approval. |
 | `databaseId`    | notion        | Target database ID.                        |
 | `token`         | notion        | Integration token (bearer).                |
 | `databaseTitle` | notion        | Optional friendly category name.           |
@@ -416,6 +417,22 @@ this, you're on an old copy; re-install from this repo.
 Expected — the initial snapshot replaces nothing with every current
 task. Subsequent incremental fetches show only real changes.
 
+**Fetch hangs for several minutes then errors with `git-remote-X died of signal 9`**
+You're on an old version. The empty-delta path used to forget to
+terminate the fast-import stream, so `git fast-import` waited forever
+and the helper blocked reading the never-closed stdin. Re-install from
+this repo. To diagnose any future hang, set `GIT_REMOTE_TASKS_DEBUG=1`
+to log every HTTP call's URL and round-trip time on stderr — if the
+HTTP traffic finishes in a second but the fetch keeps running, the
+stream is being mis-terminated.
+
+**MS Todo prints the device code, you approve it, helper still errors with `AADSTS70016`**
+Same — old version. The helper used to corrupt MSAL's `expires_at`
+deadline so it polled exactly once before giving up. Re-install. If it
+ever happens on the current version, set
+`tasks-remote.<name>.deviceFlowTimeout` to a value (in seconds) larger
+than however long you take to enter the code in the browser.
+
 **First fetch takes a long time on a large project**
 The full snapshot paginates sequentially: 7000+ tasks at 100 per page
 is ~70 round-trips. Only the first fetch is full; later fetches are
@@ -461,6 +478,14 @@ GRT_LIVE_CONFIG=/path/to/config.yaml python test_live_integration.py
 
 The live test harness never deletes or modifies items that it did not
 create, and caps created items at five per service per run.
+
+### Debugging a real fetch / push
+
+Set `GIT_REMOTE_TASKS_DEBUG=1` and re-run any git command. Per HTTP
+call, the helper logs `http[METHOD] <elapsed>s <url>` to stderr
+(query-string stripped to keep tokens out of logs). Useful when a
+fetch feels slow — if HTTP is fast but the fetch keeps running, the
+problem is in the fast-import stream, not the network.
 
 ## 14. Licence
 

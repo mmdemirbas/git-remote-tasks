@@ -1,5 +1,108 @@
 # Work log
 
+## 2026-04-15 — Fetch hang on empty deltas + MSAL device-code never authorizes
+
+Two unrelated bugs surfaced from continued live use after the page-size
+work. Both showed up as "the fetch is taking forever" but the causes
+are completely different.
+
+### Bug A — empty-delta import deadlock
+
+User report: `git fetch jira` took several minutes even when
+`sync.lastFetchAt` was a few seconds ago. Vikunja was fine.
+
+Diagnosis: added `GIT_REMOTE_TASKS_DEBUG` timing on every HTTP call.
+The trace showed exactly one Jira call (0.55s, returning zero issues)
+and then nearly 4 minutes of wall time before the helper got killed.
+A `sample(1)` of the helper showed it blocked in `_buffered_readline`
+on stdin.
+
+Root cause: when `fetch_changed` returned no changes and no deletes,
+`_cmd_import_batch` returned silently without writing anything. But
+git invoked us via `import <ref>`, which means it had already spawned
+`git fast-import` on our stdout — and fast-import only exits when it
+sees `done` or EOF. Without `done`, fast-import waited forever, git
+kept the helper's stdin open waiting for fast-import to finish, the
+helper blocked reading stdin, and the whole thing sat there until
+something killed the process.
+
+This bug was actually present in every prior version, masked by the
+fact that early fetches always had at least one new task. It only
+showed up once `lastFetchAt` was recent enough that the next fetch
+returned an empty delta.
+
+Vikunja was unaffected because in our test setup it always had at
+least one updated task in the window.
+
+Fix: write `done\n` before returning from the empty-delta branch.
+
+### Bug B — MSAL device flow always reports 'authorization_pending'
+
+User report: `git fetch mstodo` printed the device code, the user
+approved it in the browser, and the helper still raised:
+
+```
+NotImplementedError: MSAL device flow failed: AADSTS70016: ...
+the user must input their code.
+```
+
+Diagnosis: read the line that broke it.
+
+```python
+expires_in = int(flow.get("expires_in") or 600)
+flow["expires_at"] = expires_in
+```
+
+`flow["expires_at"]` is an **absolute epoch timestamp** (seconds since
+1970), not a duration. MSAL's polling loop terminates as soon as
+`time.time() > flow["expires_at"]`. Setting it to `expires_in` (~900)
+means "expired in 1970-01-01 00:15:00", so MSAL bailed on its very
+first poll iteration, returning whatever the AAD response was at that
+moment — invariably `authorization_pending` because the user can't
+possibly have approved in the few milliseconds between
+`initiate_device_flow` and the first poll.
+
+Fix: don't override `expires_at` at all unless a per-remote
+`deviceFlowTimeout` is configured to clamp BELOW the upstream
+`expires_in`. In that case, set `expires_at = min(upstream_deadline,
+now + cap)` — a real absolute deadline.
+
+### Watermark drift fix (related)
+
+While in the area, fixed a long-standing latent bug: in the
+empty-delta path, `lastFetchAt` was never promoted because the
+two-phase watermark requires the tip to move and an empty fetch never
+produces a commit. So in a quiet period each subsequent fetch
+re-queried a widening window. Now we promote `lastFetchAt` directly
+when no fast-import stream was emitted (nothing can fail between our
+exit and git's, so the two-phase guard isn't needed).
+
+### Diagnostic: `GIT_REMOTE_TASKS_DEBUG`
+
+Existing env var (previously only used by `_handle_modify`'s
+traceback path) now also makes `_http_request` log
+`http[METHOD] <elapsed>s <url-without-query>` to stderr per
+request. Operators can debug "is it the network or is it me" without
+strace.
+
+### Tests
+- `test_empty_delta_still_terminates_fast_import_stream` — pins the
+  `done\n` requirement.
+- `test_no_changes_still_advances_lastFetchAt` — pins watermark
+  promotion in the empty-delta path.
+- `test_msal_device_flow_preserves_absolute_expires_at` — pins that we
+  no longer overwrite the deadline with a small duration.
+- `test_msal_device_flow_respects_deviceFlowTimeout_cap` — covers the
+  optional clamp.
+
+348 tests, all green.
+
+### Live verification
+- `git fetch jira`: was several minutes → **1.16s** (one HTTP call,
+  empty delta, terminates cleanly).
+- `git fetch notion`: similar, **1.34s**.
+- `git fetch vikunja`: **0.24s** (already fast).
+
 ## 2026-04-15 — Fetch throughput: bump default page size and expose knob
 
 Context: first live `git fetch jira` against a 7808-issue project ran
