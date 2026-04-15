@@ -155,6 +155,7 @@ Per-remote (`tasks-remote.<name>.*`):
 | `token`         | notion        | Integration token (bearer).                |
 | `databaseTitle` | notion        | Optional friendly category name.           |
 | `httpTimeout`   | all           | Per-request timeout in seconds (default 30). |
+| `pageSize`      | jira, vikunja | Fetch page size (Jira 100/max 100, Vikunja 100/max 250). |
 
 Run `python git_remote_tasks.py check <remote>` to validate required
 keys without touching the network. Secret-like keys are redacted in
@@ -414,6 +415,23 @@ this, you're on an old copy; re-install from this repo.
 **Import produces a massive diff on first fetch**
 Expected — the initial snapshot replaces nothing with every current
 task. Subsequent incremental fetches show only real changes.
+
+**First fetch takes a long time on a large project**
+The full snapshot paginates sequentially: 7000+ tasks at 100 per page
+is ~70 round-trips. Only the first fetch is full; later fetches are
+incremental (JQL `updated >= <ts>`, Vikunja `filter=updated > <ts>`,
+MS Todo delta, Notion `last_edited_time`) and typically finish in a
+second or two. If you need a faster first run, raise `pageSize`:
+
+```bash
+git config tasks-remote.jira-work.pageSize 100     # default; max 100
+git config tasks-remote.vikunja.pageSize   250     # max for most instances
+```
+
+Jira Cloud's new `/search/jql` endpoint returns opaque
+`nextPageToken`s, so pages cannot be fetched in parallel. If you
+routinely need snapshots faster than this allows, narrow the JQL
+(`jql = assignee = currentUser() AND updated >= -30d`).
 
 **Round-trip YAML/Org changes whitespace**
 The serializers are round-trip-stable by design. If you see drift,

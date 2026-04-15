@@ -1,5 +1,36 @@
 # Work log
 
+## 2026-04-15 — Fetch throughput: bump default page size and expose knob
+
+Context: first live `git fetch jira` against a 7808-issue project ran
+~2.5 minutes. Fast-import itself is fine; the time is spent in
+sequential HTTP round-trips (156 pages × RTT).
+
+### Change
+- New `Driver._page_size()` reads `tasks-remote.<name>.pageSize` and
+  clamps to each driver's `PAGE_SIZE_MAX`.
+- Jira: default 50 → 100 (the cap on Jira Cloud's `/search/jql`). Halves
+  round-trips on any project over 50 issues.
+- Vikunja: default 50 → 100 (`PAGE_SIZE_MAX` 250). Same motivation.
+- Notion already uses the API's default 100; unchanged.
+- MS Todo delta-query semantics don't expose a page-size knob; unchanged.
+
+### Non-goals
+- Parallel pagination: rejected for Jira's new endpoint because
+  `nextPageToken` is opaque. The legacy `startAt` path could parallelize
+  after one `total` read, but the complexity isn't worth it when the
+  incremental path covers every subsequent fetch.
+- Local CPU: fast-import on 8k small blobs takes under a second.
+
+### Tests
+- Unit tests for `_page_size`: default, override, empty string, non-numeric
+  fallback, clamp to 1, clamp to max, per-driver max.
+- Integration-style tests on Jira + Vikunja that assert the emitted URL
+  contains the expected `maxResults=` / `per_page=` value both for the
+  default and a config override.
+
+344 tests, all green.
+
 ## 2026-04-15 — First live run against all four services
 
 Exercised every driver end-to-end against real remotes (Vikunja on
