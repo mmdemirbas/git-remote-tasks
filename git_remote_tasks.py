@@ -365,7 +365,10 @@ class YAMLSerializer(Serializer):
             cur_indent = len(ln) - len(ln.lstrip(" "))
             if cur_indent < base_indent:
                 break
-            m = re.match(r"^\s+([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$", ln)
+            # BUG-06: permit hyphens in nested keys (e.g. `due-date:`) so
+            # hand-edits don't vanish. Unknown keys are still dropped at
+            # the deserialize-to-schema step.
+            m = re.match(r"^\s+([A-Za-z_][A-Za-z0-9_\-]*):\s*(.*)$", ln)
             if m:
                 sub[m.group(1)] = _parse_yaml_inline_scalar(m.group(2))
             i += 1
@@ -462,6 +465,12 @@ class OrgSerializer(Serializer):
             headline_parts.append(f"[#{pri}]")
         headline_parts.append(title)
         out = [" ".join(headline_parts)]
+        # FEAT-05: DEADLINE belongs on the line immediately below the
+        # headline so Emacs / nvim-orgmode pick it up in the agenda. The
+        # :PROPERTIES: drawer follows.
+        if t["due_date"]:
+            out.append("  DEADLINE: "
+                       + _iso_to_org_timestamp(t["due_date"], active=True))
         props: list[tuple[str, str]] = []
         if t["id"]:
             props.append(("ID", t["id"]))
@@ -471,8 +480,6 @@ class OrgSerializer(Serializer):
             props.append(("CREATED", _iso_to_org_timestamp(t["created_date"])))
         if t["updated_date"]:
             props.append(("UPDATED", _iso_to_org_timestamp(t["updated_date"])))
-        if t["due_date"]:
-            props.append(("DEADLINE", _iso_to_org_timestamp(t["due_date"], active=True)))
         cat = t["category"] or {}
         if cat.get("name"):
             props.append(("CATEGORY", cat["name"]))
@@ -512,17 +519,28 @@ class OrgSerializer(Serializer):
             return t
         self._parse_headline(lines[i], t)
         i += 1
-        # Parse drawers and body.
+        # Parse drawers, agenda timestamps, and body.
         body_lines: list[str] = []
         while i < len(lines):
+            # BUG-11: a second '* ' headline terminates this task's drawers.
+            if lines[i].lstrip().startswith("*") and lines[i].lstrip() != "*":
+                break
             stripped = lines[i].strip()
             if stripped == ":PROPERTIES:":
                 i = self._parse_properties(lines, i + 1, t)
-            elif stripped == ":LOGBOOK:":
+                continue
+            if stripped == ":LOGBOOK:":
                 i = self._parse_logbook(lines, i + 1, t)
-            else:
-                body_lines.append(lines[i])
+                continue
+            # FEAT-05: DEADLINE and SCHEDULED agenda lines appearing between
+            # the headline and the drawer.
+            m_dl = re.match(r"^\s*DEADLINE:\s*(\S.*)$", lines[i])
+            if m_dl:
+                t["due_date"] = _org_timestamp_to_iso(m_dl.group(1).strip())
                 i += 1
+                continue
+            body_lines.append(lines[i])
+            i += 1
         body = self._dedent_body(body_lines).strip("\n")
         t["description"] = body if body else None
         return t
@@ -548,6 +566,12 @@ class OrgSerializer(Serializer):
         i = start
         cat = dict(t["category"])
         while i < len(lines) and lines[i].strip() != ":END:":
+            # BUG-11: a stray '* ' headline means this drawer was never
+            # closed. Abandon the drawer rather than swallowing the next
+            # task's content.
+            if lines[i].lstrip().startswith("* "):
+                t["category"] = cat
+                return i
             m = re.match(r"^\s*:([A-Z_]+):\s*(.*)$", lines[i])
             if m:
                 key, value = m.group(1), m.group(2).strip()
@@ -933,8 +957,11 @@ class JiraDriver(Driver):
                 "name": project.get("name"),
                 "type": "project",
             }
-        base = self.config.get("baseUrl") or self.url or ""
-        if key and base:
+        # BUG-08: only use a real HTTP(S) base; self.url is the git-remote
+        # URL like `jira://company.atlassian.net` and would produce an
+        # unclickable `jira://...` link.
+        base = self.config.get("baseUrl") or ""
+        if key and base.startswith(("http://", "https://")):
             t["url"] = f"{base.rstrip('/')}/browse/{key}"
         return t
 
@@ -2077,8 +2104,12 @@ class ProtocolHandler:
                 f"no changes were sent to the remote service.",
             )
             self._record_export_error(current_ref, "upsert not implemented")
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:
             self._log(f"upsert failed: {exc}")
+            if os.environ.get("GIT_REMOTE_TASKS_DEBUG"):
+                import traceback
+                self.stderr.write(traceback.format_exc())
+                self.stderr.flush()
             self._record_export_error(current_ref, f"upsert failed: {exc}")
 
     def _handle_delete(self, line: str, current_ref: str | None) -> None:
@@ -2101,8 +2132,12 @@ class ProtocolHandler:
                 f"no changes were sent to the remote service.",
             )
             self._record_export_error(current_ref, "delete not implemented")
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:
             self._log(f"delete failed: {exc}")
+            if os.environ.get("GIT_REMOTE_TASKS_DEBUG"):
+                import traceback
+                self.stderr.write(traceback.format_exc())
+                self.stderr.flush()
             self._record_export_error(current_ref, f"delete failed: {exc}")
 
 
@@ -2137,6 +2172,10 @@ def cmd_install(args) -> int:
             link.unlink()
         os.symlink(str(src), str(link))
         print(f"installed {link}")
+    # DX-03: absolute-path symlinks break silently when the script file
+    # moves. Make that failure mode visible at install time and keep the
+    # resolved path discoverable via `ls -l`.
+    print(f"(symlinks point to {src} — re-run `install` if you move it)")
     path_env = os.environ.get("PATH", "")
     on_path = any(Path(os.path.expanduser(p)).resolve() == bin_dir
                   for p in path_env.split(os.pathsep) if p)
@@ -2284,6 +2323,21 @@ def _redact_config_value(key: str) -> bool:
     return any(sub in k for sub in _SECRET_CONFIG_SUBSTRINGS)
 
 
+def _missing_required_keys(scheme: str, config: dict) -> list[str]:
+    """Return a sorted list of required-key descriptions that are unset.
+
+    One-of requirements (BUG-10 for msftodo auth) are rendered as
+    'keyA or keyB' so the operator sees the choice.
+    """
+    required = REMOTE_REQUIRED_KEYS.get(scheme, ())
+    missing = [k for k in required if not config.get(k)]
+    if scheme == "msftodo":
+        # Either accessToken OR clientId (MSAL device flow) must be set.
+        if not config.get("accessToken") and not config.get("clientId"):
+            missing.append("accessToken or clientId")
+    return missing
+
+
 def cmd_check(args) -> int:
     config = read_remote_config(args.remote_name)
     if not config:
@@ -2294,8 +2348,7 @@ def cmd_check(args) -> int:
         print(f"error: remote {args.remote_name!r} has invalid scheme {scheme!r}",
               file=sys.stderr)
         return 2
-    required = REMOTE_REQUIRED_KEYS.get(scheme, ())
-    missing = [k for k in required if not config.get(k)]
+    missing = _missing_required_keys(scheme, config)
     print(f"remote: {args.remote_name}")
     print(f"scheme: {scheme}")
     for k, v in sorted(config.items()):

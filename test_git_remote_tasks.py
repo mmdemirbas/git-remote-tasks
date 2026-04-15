@@ -259,6 +259,107 @@ class TestOrgSerializer(unittest.TestCase):
     def test_iso_to_org_timestamp_bad_input_passthrough(self):
         self.assertIn("not-a-date", grt._iso_to_org_timestamp("not-a-date"))
 
+    def test_deadline_rendered_as_agenda_line_feat05(self):
+        s = grt.OrgSerializer()
+        t = full_task(due_date="2025-04-20")
+        text = s.serialize(t)
+        lines = text.splitlines()
+        # First line is the headline; the agenda DEADLINE must precede
+        # the :PROPERTIES: drawer so Emacs/nvim-orgmode see it.
+        headline_idx = next(i for i, ln in enumerate(lines)
+                             if ln.startswith("* "))
+        props_idx = next(i for i, ln in enumerate(lines)
+                          if ln.strip() == ":PROPERTIES:")
+        deadline_idx = next(i for i, ln in enumerate(lines)
+                             if ln.strip().startswith("DEADLINE:"))
+        self.assertLess(headline_idx, deadline_idx)
+        self.assertLess(deadline_idx, props_idx)
+        # DEADLINE must NOT also be inside the drawer.
+        self.assertFalse(any(":DEADLINE:" in ln for ln in lines))
+
+    def test_deadline_agenda_roundtrip_feat05(self):
+        s = grt.OrgSerializer()
+        t = full_task(due_date="2025-04-20")
+        back = s.deserialize(s.serialize(t))
+        self.assertEqual(back["due_date"], "2025-04-20")
+
+    def test_deadline_legacy_property_still_parses(self):
+        s = grt.OrgSerializer()
+        legacy = (
+            "* TODO Title\n"
+            "  :PROPERTIES:\n"
+            "  :ID: x\n"
+            "  :DEADLINE: <2025-04-20 Sun>\n"
+            "  :END:\n"
+        )
+        self.assertEqual(s.deserialize(legacy)["due_date"], "2025-04-20")
+
+    def test_bug11_stray_second_headline_terminates_drawer(self):
+        s = grt.OrgSerializer()
+        # Missing :END: — drawer must abort before the second headline
+        # rather than swallowing it.
+        src = (
+            "* TODO First\n"
+            "  :PROPERTIES:\n"
+            "  :ID: first-1\n"
+            "* TODO Second\n"
+            "  :PROPERTIES:\n"
+            "  :ID: second-1\n"
+            "  :END:\n"
+        )
+        t = s.deserialize(src)
+        self.assertEqual(t["title"], "First")
+        self.assertEqual(t["id"], "first-1")
+
+
+class TestBug08JiraUrl(unittest.TestCase):
+    def test_jira_url_omitted_when_no_http_base(self):
+        d = grt.JiraDriver("jira", "jira://company", {"email": "a", "apiToken": "t"})
+        issue = {"key": "PROJ-1", "fields": {
+            "summary": "t", "status": {"name": "To Do"},
+            "project": {"key": "PROJ", "name": "Project"},
+        }}
+        self.assertEqual(d.normalize(issue)["url"], None)
+
+    def test_jira_url_set_when_http_base_present(self):
+        d = grt.JiraDriver("jira", "jira://company", {
+            "baseUrl": "https://x.atlassian.net",
+            "email": "a", "apiToken": "t",
+        })
+        issue = {"key": "PROJ-1", "fields": {
+            "summary": "t", "status": {"name": "To Do"},
+            "project": {"key": "PROJ", "name": "Project"},
+        }}
+        self.assertEqual(d.normalize(issue)["url"],
+                          "https://x.atlassian.net/browse/PROJ-1")
+
+
+class TestBug10MsftodoCheck(unittest.TestCase):
+    def test_missing_access_token_and_client_id(self):
+        missing = grt._missing_required_keys(
+            "msftodo", {"scheme": "msftodo", "tenantId": "consumers"})
+        self.assertIn("accessToken or clientId", missing)
+
+    def test_access_token_alone_is_sufficient(self):
+        missing = grt._missing_required_keys(
+            "msftodo", {"scheme": "msftodo", "tenantId": "consumers",
+                         "clientId": "",
+                         "accessToken": "t"})
+        self.assertNotIn("accessToken or clientId", missing)
+
+    def test_client_id_alone_is_sufficient(self):
+        missing = grt._missing_required_keys(
+            "msftodo", {"scheme": "msftodo", "tenantId": "consumers",
+                         "clientId": "c"})
+        self.assertNotIn("accessToken or clientId", missing)
+
+
+class TestBug06YamlHyphenKeys(unittest.TestCase):
+    def test_nested_hyphen_key_is_preserved(self):
+        text = "category:\n  id: A\n  name: B\n  type: other\n  extra-key: val\n"
+        parsed = grt.YAMLSerializer()._parse(text)
+        self.assertEqual(parsed["category"]["extra-key"], "val")
+
 
 # ---------------------------------------------------------------------------
 # Symmetry

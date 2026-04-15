@@ -74,6 +74,9 @@ git fetch vikunja
 git log vikunja/main
 git diff main vikunja/main
 
+# First time only, merge the unrelated-history root commit:
+git merge vikunja/main --allow-unrelated-histories
+
 # Make changes and push.
 $EDITOR tasks/vikunja-42.yaml
 git add tasks/
@@ -330,8 +333,12 @@ overridden through `fieldMap.*` config keys (see §7.2 mapping).
 | `git push <remote> main`          | Upserts edited tasks; deletes removed files.   |
 | `git tag release/2025-W16`        | Snapshots the task state at a moment in time.  |
 
-Because every sync is a real commit, `git bisect` works on the task history —
-useful for answering "when did that ticket's priority change?".
+Each sync now bases the new commit on the previous remote tip (via
+`from <sha>` in the fast-import stream), so `refs/remotes/<remote>/main`
+accumulates a real linear history and `git bisect` walks every sync.
+`git merge <remote>/main` works without `--allow-unrelated-histories`
+except on the very first fetch, when the remote-tracking ref is still
+a root commit.
 
 ## 11. Org-mode tips
 
