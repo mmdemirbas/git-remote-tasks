@@ -1350,13 +1350,32 @@ def cmd_install(args) -> int:
 
 def cmd_uninstall(args) -> int:
     bin_dir = Path(os.path.expanduser(args.bin_dir)).resolve()
+    src = _script_path()
     for scheme in SCHEMES:
         link = bin_dir / f"git-remote-{scheme}"
+        if not link.exists() and not link.is_symlink():
+            print(f"skip {link} (not present)")
+            continue
+        if not link.is_symlink():
+            print(f"skip {link} (not a symlink; refusing to remove unrelated file)",
+                  file=sys.stderr)
+            continue
+        try:
+            target = Path(os.readlink(link))
+            if not target.is_absolute():
+                target = (link.parent / target).resolve()
+            else:
+                target = target.resolve()
+        except OSError as exc:
+            print(f"warning: could not read {link}: {exc}", file=sys.stderr)
+            continue
+        if target != src:
+            print(f"skip {link} (points to {target}, not {src})",
+                  file=sys.stderr)
+            continue
         try:
             os.unlink(link)
             print(f"removed {link}")
-        except FileNotFoundError:
-            print(f"skip {link} (not present)")
         except OSError as exc:
             print(f"warning: could not remove {link}: {exc}", file=sys.stderr)
     return 0
@@ -1366,6 +1385,24 @@ def cmd_list_schemes(args) -> int:
     for scheme, cls in SCHEMES.items():
         print(f"{scheme:10s} {cls.__name__}")
     return 0
+
+
+_SAFE_CONFIG_KEYS = {
+    "scheme", "baseurl", "email", "tenantid", "clientid",
+    "databaseid", "databasetitle",
+}
+_SECRET_CONFIG_SUBSTRINGS = (
+    "token", "password", "secret", "key", "credential", "bearer",
+)
+
+
+def _redact_config_value(key: str) -> bool:
+    """Return True if the value of this config key should be redacted."""
+    k = key.lower()
+    if k in _SAFE_CONFIG_KEYS:
+        return False
+    # Be conservative: any key containing a secret-like substring is redacted.
+    return any(sub in k for sub in _SECRET_CONFIG_SUBSTRINGS)
 
 
 def cmd_check(args) -> int:
@@ -1383,7 +1420,7 @@ def cmd_check(args) -> int:
     print(f"remote: {args.remote_name}")
     print(f"scheme: {scheme}")
     for k, v in sorted(config.items()):
-        shown = "<redacted>" if "token" in k.lower() or "password" in k.lower() else v
+        shown = "<redacted>" if _redact_config_value(k) else v
         print(f"  {k} = {shown}")
     if missing:
         print(f"error: missing required keys: {', '.join(missing)}", file=sys.stderr)

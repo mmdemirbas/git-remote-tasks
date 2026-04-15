@@ -1148,6 +1148,31 @@ class TestManagementCommands(unittest.TestCase):
             rc = grt.cmd_uninstall(args)
             self.assertEqual(rc, 0)
 
+    def test_uninstall_refuses_to_remove_regular_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            link = Path(d) / "git-remote-jira"
+            link.write_text("unrelated binary")
+            args = mock.Mock(bin_dir=d)
+            err = io.StringIO()
+            with mock.patch.object(sys, "stderr", err):
+                grt.cmd_uninstall(args)
+            self.assertTrue(link.exists(), "regular file must not be removed")
+            self.assertIn("not a symlink", err.getvalue())
+
+    def test_uninstall_refuses_to_remove_symlink_to_other_target(self):
+        with tempfile.TemporaryDirectory() as d:
+            other_target = Path(d) / "other-tool"
+            other_target.write_text("#!/bin/sh\necho other")
+            link = Path(d) / "git-remote-jira"
+            os.symlink(str(other_target), str(link))
+            args = mock.Mock(bin_dir=d)
+            err = io.StringIO()
+            with mock.patch.object(sys, "stderr", err):
+                grt.cmd_uninstall(args)
+            self.assertTrue(link.is_symlink(),
+                             "symlink to other target must not be removed")
+            self.assertIn("points to", err.getvalue())
+
     def test_check_missing_config(self):
         err = io.StringIO()
         with mock.patch.object(grt, "read_remote_config", return_value={}), \
@@ -1188,6 +1213,31 @@ class TestManagementCommands(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("ok: all required", out.getvalue())
         self.assertIn("<redacted>", out.getvalue())
+        # email and baseUrl are safe to show
+        self.assertIn("email = e", out.getvalue())
+        self.assertIn("baseUrl = u", out.getvalue())
+
+    def test_check_redacts_varied_secret_keys(self):
+        config = {
+            "scheme": "notion",
+            "databaseId": "db",
+            "token": "t",
+            "clientSecret": "s",
+            "accessToken": "a",
+            "apiKey": "k",
+            "credential": "c",
+            "bearerToken": "b",
+        }
+        out = io.StringIO()
+        with mock.patch.object(grt, "read_remote_config", return_value=config), \
+                mock.patch.object(sys, "stdout", out):
+            grt.cmd_check(mock.Mock(remote_name="x"))
+        body = out.getvalue()
+        for secret_val in ("t", "s", "a", "k", "c", "b"):
+            self.assertNotIn(f"= {secret_val}\n", body,
+                              f"raw secret {secret_val!r} leaked")
+        # databaseId is explicitly safe — must be shown.
+        self.assertIn("databaseId = db", body)
 
     def test_argparser_builds(self):
         p = grt.build_argparser()
