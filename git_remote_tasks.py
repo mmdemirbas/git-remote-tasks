@@ -1199,12 +1199,31 @@ class ProtocolHandler:
         self._write("\n")
 
     def _read_exactly(self, n: int) -> bytes:
+        """Read exactly n bytes from stdin, honoring byte counts even for text streams.
+
+        Real git invocations expose stdin.buffer (binary). Tests often pass an
+        io.StringIO. For the text fallback we read characters until the UTF-8
+        encoding of the accumulated text hits n bytes — never more — so multi-byte
+        bodies round-trip correctly.
+        """
         buf = getattr(self.stdin, "buffer", None)
         if buf is not None:
             data = buf.read(n)
-        else:
-            data = self.stdin.read(n).encode("utf-8") if hasattr(self.stdin, "read") else b""
-        return data if isinstance(data, bytes) else bytes(data, "utf-8")
+            return data if isinstance(data, bytes) else bytes(data, "utf-8")
+        if not hasattr(self.stdin, "read"):
+            return b""
+        collected = bytearray()
+        while len(collected) < n:
+            ch = self.stdin.read(1)
+            if not ch:
+                break
+            chunk = ch.encode("utf-8")
+            if len(collected) + len(chunk) > n:
+                # Should not happen if caller respects byte counts, but bail out
+                # rather than silently mis-align.
+                break
+            collected.extend(chunk)
+        return bytes(collected)
 
     def _handle_modify(self, line: str, marks: dict[str, bytes]) -> None:
         # M <mode> <sha-or-mark> <path>

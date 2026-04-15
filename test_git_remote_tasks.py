@@ -1373,6 +1373,35 @@ class TestMSTodoMsalFlag(unittest.TestCase):
         self.assertIsInstance(grt.MSAL_AVAILABLE, bool)
 
 
+class TestReadExactlyMultibyte(unittest.TestCase):
+    def test_fallback_reads_bytes_not_chars(self):
+        task = full_task(id="fake-X", title="üñîçödé")
+        body = grt.YAMLSerializer().serialize(task)
+        blen = len(body.encode("utf-8"))
+        stream = (
+            "export\n"
+            f"blob\nmark :1\ndata {blen}\n{body}\n"
+            "commit refs/heads/main\n"
+            f"committer g <g@g> 0 +0000\n"
+            f"data 2\nhi\n"
+            f"M 100644 :1 tasks/fake-X.yaml\n"
+            "\ndone\n"
+        )
+        driver = FakeDriver()
+        h = make_handler(driver=driver, stdin_text=stream)
+        h.run()
+        self.assertEqual(len(driver.upserted), 1)
+        self.assertEqual(driver.upserted[0]["title"], "üñîçödé")
+
+    def test_fallback_no_read_attribute_returns_empty(self):
+        class Stub:
+            pass
+        h = grt.ProtocolHandler("r", "u", FakeDriver(), grt.YAMLSerializer(),
+                                stdin=Stub(), stdout=io.StringIO(),
+                                stderr=io.StringIO())
+        self.assertEqual(h._read_exactly(5), b"")
+
+
 class TestProtocolExportEdge(unittest.TestCase):
     def test_m_line_too_short_ignored(self):
         driver = FakeDriver()
