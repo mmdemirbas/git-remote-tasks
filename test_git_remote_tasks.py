@@ -597,12 +597,15 @@ class TestMSTodoIncrementalDelta(unittest.TestCase):
         self.assertEqual(deleted, [])
         self.assertEqual(w.call_count, 1)
         key, val = w.call_args[0]
-        self.assertIn("sync.deltaLink.", key)
+        # Variable name must start with a letter (git config rule),
+        # so the key uses a `-` joiner and an `l` prefix on the hex id.
+        self.assertIn("sync.deltaLink-l", key)
+        self.assertNotIn("sync.deltaLink.", key)
         self.assertIn("token=AAA", val)
 
     def test_subsequent_fetch_uses_stored_delta_link(self):
-        list_hex = "L1".encode("utf-8").hex()
-        self.d.config[f"sync.deltaLink.{list_hex}"] = (
+        list_hex = "l" + "L1".encode("utf-8").hex()
+        self.d.config[f"sync.deltaLink-{list_hex}"] = (
             "https://graph.microsoft.com/v1.0/delta-link-stored")
         called: list[str] = []
         def fake_get(url, headers=None):
@@ -1029,6 +1032,16 @@ class TestSafeTaskId(unittest.TestCase):
         self.assertTrue(grt.is_safe_task_id("a" * 255))
         self.assertFalse(grt.is_safe_task_id("a" * 256))
 
+    def test_base64_padding_equals_allowed(self):
+        # MS Todo task ids are base64url with `=` padding. `=` is safe
+        # in a filename on every filesystem we care about, never a
+        # traversal or shell-metachar risk, and rejecting it drops every
+        # MS Todo task on the floor with a warning.
+        self.assertTrue(grt.is_safe_task_id(
+            "mstodo-AQMkADAwATYwMAItYWM0YS1hMzhlLTAwA=="
+        ))
+        self.assertTrue(grt.is_safe_task_id("mstodo-abc="))
+
 
 class TestPageSizeHelper(unittest.TestCase):
     """`Driver._page_size()` reads config, falls back, and clamps."""
@@ -1350,6 +1363,58 @@ class TestEmptyDeltaNoCommit(unittest.TestCase):
         out = h.stdout.getvalue()
         self.assertNotIn("commit refs/heads/main", out,
                           "empty delta must not produce a commit")
+
+    def test_fetch_prints_summary_on_full_snapshot(self):
+        driver = IncrementalFakeDriver(full=[
+            grt.empty_task() | {"id": "fake-1", "source": "fake",
+                                 "title": "a"},
+            grt.empty_task() | {"id": "fake-2", "source": "fake",
+                                 "title": "b"},
+        ])
+        driver.config = {}  # no sync.lastFetchAt → full path
+        h = make_handler(driver=driver,
+                         stdin_text="import refs/heads/main\n\n")
+        h.run()
+        err = h.stderr.getvalue()
+        self.assertIn("fetched 2 tasks (full snapshot)", err)
+
+    def test_fetch_prints_summary_on_empty_incremental(self):
+        driver = IncrementalFakeDriver(changed=[], deleted=[])
+        driver.config = {
+            "sync.mode": "incremental",
+            "sync.lastFetchAt": "2026-04-15T00:00:00Z",
+        }
+        def fake_run(cmd, *args, **kwargs):
+            if "rev-parse" in cmd:
+                return mock.Mock(returncode=0, stdout="a" * 40 + "\n",
+                                  stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        h = make_handler(driver=driver,
+                         stdin_text="import refs/heads/main\n\n")
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            h.run()
+        self.assertIn("up to date", h.stderr.getvalue())
+
+    def test_fetch_prints_summary_on_non_empty_incremental(self):
+        driver = IncrementalFakeDriver(
+            changed=[grt.empty_task() | {"id": "fake-1", "source": "fake",
+                                          "title": "x"}],
+            deleted=["fake-9"],
+        )
+        driver.config = {
+            "sync.mode": "incremental",
+            "sync.lastFetchAt": "2026-04-15T00:00:00Z",
+        }
+        def fake_run(cmd, *args, **kwargs):
+            if "rev-parse" in cmd:
+                return mock.Mock(returncode=0, stdout="a" * 40 + "\n",
+                                  stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        h = make_handler(driver=driver,
+                         stdin_text="import refs/heads/main\n\n")
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            h.run()
+        self.assertIn("1 changed, 1 deleted", h.stderr.getvalue())
 
     def test_empty_delta_still_terminates_fast_import_stream(self):
         # Regression: when there are no changes and no deletes, the

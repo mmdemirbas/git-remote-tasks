@@ -91,7 +91,7 @@ TASK_FIELDS = (
 )
 
 
-_SAFE_TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
+_SAFE_TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._=-]{0,254}")
 
 
 def _is_safe_tasks_path(path: str) -> bool:
@@ -1952,8 +1952,14 @@ class MSTodoDriver(Driver):
         and may contain `=` / `_` which git config rejects in variable
         names, so we hex-encode for the key form.
         """
-        list_safe = list_id.encode("utf-8").hex()
-        key = f"sync.deltaLink.{list_safe}"
+        # Git config variable names must start with a letter. Hex-encoded
+        # list ids usually start with a digit, which made every write
+        # `invalid key: ...` and effectively disabled delta persistence.
+        # Use `-` as the final separator (keeps the variable name as
+        # `deltaLink-<hex>`, starting with `d`) and a per-run letter
+        # prefix on the hex itself for defence in depth.
+        list_safe = "l" + list_id.encode("utf-8").hex()
+        key = f"sync.deltaLink-{list_safe}"
         stored = self.config.get(key) if use_delta else None
         if stored:
             return stored, key
@@ -2612,6 +2618,8 @@ class ProtocolHandler:
             tasks_sorted = sorted(tasks, key=lambda t: t.get("id") or "")
             self._write_fast_import(tasks_sorted, parent=parent)
             self._record_pending_since(self.driver._now_iso(), parent)
+            self._log_fetch_summary(mode="full", changed=len(tasks_sorted),
+                                     deleted=0, since=None)
             return
 
         changed, deleted_ids, new_since = self.driver.fetch_changed(since)
@@ -2637,12 +2645,38 @@ class ProtocolHandler:
             promote = new_since or since
             if promote:
                 self._commit_pending_since(promote)
+            self._log_fetch_summary(mode="incremental", changed=0,
+                                     deleted=0, since=since)
             return
         changed_sorted = sorted(changed, key=lambda t: t.get("id") or "")
         self._write_incremental_import(changed_sorted, deleted_ids,
                                         parent=parent)
         if new_since:
             self._record_pending_since(new_since, parent)
+        self._log_fetch_summary(mode="incremental",
+                                 changed=len(changed_sorted),
+                                 deleted=len(deleted_ids), since=since)
+
+    def _log_fetch_summary(self, mode: str, changed: int, deleted: int,
+                            since: str | None) -> None:
+        """One-line stderr report per fetch.
+
+        git shows `* [new branch] main -> <remote>/main` after a successful
+        fetch, but nothing about how much work actually happened. This
+        fills that gap so the user can tell "incremental found nothing" from
+        "something went wrong and git is lying". Deliberately terse: one
+        line, no colour, no heuristics.
+        """
+        if mode == "full":
+            msg = f"{self.remote_name}: fetched {changed} tasks (full snapshot)"
+        elif changed == 0 and deleted == 0:
+            tail = f" since {since}" if since else ""
+            msg = f"{self.remote_name}: up to date{tail}"
+        else:
+            tail = f" since {since}" if since else ""
+            msg = (f"{self.remote_name}: {changed} changed, "
+                   f"{deleted} deleted{tail}")
+        self._log(msg)
 
     def _record_pending_since(self, value: str, parent: str | None) -> None:
         """Phase 1 of the two-phase sync watermark.
@@ -2752,7 +2786,7 @@ class ProtocolHandler:
                 self._warn_once(
                     "unsafe-id",
                     f"skipping task with unsafe id {tid!r}: "
-                    f"must match [A-Za-z0-9][A-Za-z0-9._-]* (≤255 chars).",
+                    f"must match [A-Za-z0-9][A-Za-z0-9._=-]* (≤255 chars).",
                 )
                 continue
             idx += 1
