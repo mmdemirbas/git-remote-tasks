@@ -51,6 +51,41 @@ TASK_FIELDS = (
 )
 
 
+_SAFE_TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
+
+
+def _is_safe_tasks_path(path: str) -> bool:
+    """Return True when `path` is exactly `tasks/<id>.<ext>` with no traversal.
+
+    Rejects `tasks/../etc/passwd`, `tasks//foo.yaml`, and any path that
+    pathlib normalizes to something outside `tasks/`. Used at every
+    import/export boundary alongside `is_safe_task_id`.
+    """
+    if not path.startswith("tasks/"):
+        return False
+    rest = path[len("tasks/"):]
+    if not rest or "/" in rest or "\\" in rest:
+        return False
+    if ".." in rest.split("."):
+        return False
+    return True
+
+
+def is_safe_task_id(task_id: str) -> bool:
+    """Return True when task_id can safely become a filesystem basename.
+
+    The repo's task files live at `tasks/<id>.<ext>`; any id with `/`, `..`,
+    leading `.`, or control characters could escape the directory or shadow a
+    git-internal name. Uses `fullmatch` so embedded control characters
+    (including a trailing `\\n`) do not slip past the anchor.
+    """
+    if not isinstance(task_id, str) or not task_id:
+        return False
+    if task_id in (".", "..") or "/" in task_id or "\\" in task_id:
+        return False
+    return bool(_SAFE_TASK_ID_RE.fullmatch(task_id))
+
+
 def empty_task() -> dict:
     """Build a task dict with all schema fields at their neutral defaults."""
     return {
@@ -643,14 +678,21 @@ def serializer_for_extension(path: str) -> Serializer:
 # Config reader
 # ============================================================================
 
+_GIT_SUBPROCESS_TIMEOUT = 10.0
+
+
 def _run_git_config(args: list[str]) -> str | None:
     try:
         proc = subprocess.run(
             ["git", "config", "--local", *args],
             capture_output=True, text=True, check=False,
+            timeout=_GIT_SUBPROCESS_TIMEOUT,
         )
     except (FileNotFoundError, OSError) as exc:
         print(f"git-remote-tasks: git config failed: {exc}", file=sys.stderr)
+        return None
+    except subprocess.TimeoutExpired:
+        print("git-remote-tasks: git config timed out", file=sys.stderr)
         return None
     if proc.returncode != 0:
         if proc.stderr.strip():
@@ -695,14 +737,27 @@ def read_remote_config(remote_name: str) -> dict:
 
 
 def write_config_value(key: str, value: str) -> bool:
-    """Write a single key/value to the local git config. Returns True on success."""
+    """Write a single key/value to the local git config. Returns True on success.
+
+    Rejects values containing embedded newlines because `git config
+    --get-regexp` returns one key=value record per line and a value with an
+    LF would smear across records on the next read (S2-03).
+    """
+    if "\n" in value or "\r" in value:
+        print("git-remote-tasks: refusing to write config value containing newline",
+              file=sys.stderr)
+        return False
     try:
         proc = subprocess.run(
             ["git", "config", "--local", key, value],
             capture_output=True, text=True, check=False,
+            timeout=_GIT_SUBPROCESS_TIMEOUT,
         )
     except (FileNotFoundError, OSError) as exc:
         print(f"git-remote-tasks: git config write failed: {exc}", file=sys.stderr)
+        return False
+    except subprocess.TimeoutExpired:
+        print("git-remote-tasks: git config write timed out", file=sys.stderr)
         return False
     if proc.returncode != 0:
         if proc.stderr.strip():
@@ -710,6 +765,29 @@ def write_config_value(key: str, value: str) -> bool:
                   file=sys.stderr)
         return False
     return True
+
+
+def unset_config_values(pattern: str) -> bool:
+    """Remove all local config keys matching `<pattern>` (regex).
+
+    Used by `reset` to wipe `tasks-remote.<name>.sync.*` state. `git config
+    --unset-all` with `--get-regexp` is a single subprocess per matching key;
+    we list-and-unset so unknown keys don't error.
+    """
+    out = _run_git_config(["--get-regexp", pattern])
+    if not out:
+        return True
+    ok = True
+    for line in out.splitlines():
+        key = line.split(" ", 1)[0]
+        proc = subprocess.run(
+            ["git", "config", "--local", "--unset-all", key],
+            capture_output=True, text=True, check=False,
+            timeout=_GIT_SUBPROCESS_TIMEOUT,
+        )
+        if proc.returncode != 0:
+            ok = False
+    return ok
 
 
 # ============================================================================
@@ -745,17 +823,87 @@ class Driver(ABC):
     def _http_delete(self, url: str, headers: dict | None = None) -> dict:
         return self._http_request("DELETE", url, headers=headers, body=None)
 
+    HTTP_TIMEOUT_DEFAULT = 30.0
+    HTTP_RETRY_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+    HTTP_MAX_RETRIES = 3
+
     def _http_request(self, method: str, url: str, headers: dict | None = None,
                       body: dict | None = None) -> dict:
+        """Single-shot HTTP with timeout and bounded retry on transient errors.
+
+        Timeout defaults to 30s, overridable per remote via
+        `tasks-remote.<name>.httpTimeout`. Retries the request up to
+        `HTTP_MAX_RETRIES` times on a 408/425/429/5xx response or a
+        `URLError` (network hiccup) with exponential backoff starting at
+        0.5s, capped at 10s. Error message redacts auth headers.
+        """
         data = json.dumps(body).encode("utf-8") if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method)
-        for k, v in (headers or {}).items():
-            req.add_header(k, v)
-        if body is not None and "Content-Type" not in (headers or {}):
-            req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req) as resp:  # pragma: no cover - network
-            raw = resp.read().decode("utf-8")
-        return json.loads(raw) if raw else {}
+        merged_headers = dict(headers or {})
+        if body is not None and "Content-Type" not in merged_headers:
+            merged_headers["Content-Type"] = "application/json"
+        timeout = self._http_timeout()
+
+        attempt = 0
+        backoff = 0.5
+        last_exc: Exception | None = None
+        while attempt <= self.HTTP_MAX_RETRIES:
+            attempt += 1
+            req = urllib.request.Request(url, data=data, method=method)
+            for k, v in merged_headers.items():
+                req.add_header(k, v)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as exc:
+                if exc.code in self.HTTP_RETRY_STATUSES \
+                        and attempt <= self.HTTP_MAX_RETRIES:
+                    self._sleep_backoff(backoff)
+                    backoff = min(backoff * 2, 10.0)
+                    last_exc = exc
+                    continue
+                raise self._redact_http_error(exc, url) from exc
+            except urllib.error.URLError as exc:
+                # Typically a transient network issue; retry.
+                if attempt <= self.HTTP_MAX_RETRIES:
+                    self._sleep_backoff(backoff)
+                    backoff = min(backoff * 2, 10.0)
+                    last_exc = exc
+                    continue
+                raise
+        if last_exc is not None:  # pragma: no cover - fall-through on exhaustion
+            raise last_exc
+        return {}
+
+    def _http_timeout(self) -> float:
+        raw = self.config.get("httpTimeout")
+        if not raw:
+            return self.HTTP_TIMEOUT_DEFAULT
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return self.HTTP_TIMEOUT_DEFAULT
+
+    @staticmethod
+    def _sleep_backoff(seconds: float) -> None:  # pragma: no cover - timing
+        import time
+        time.sleep(seconds)
+
+    @staticmethod
+    def _redact_http_error(exc: urllib.error.HTTPError,
+                            url: str) -> urllib.error.HTTPError:
+        """Return an HTTPError whose string form omits auth and bodies.
+
+        The default HTTPError repr includes `hdrs` and `msg`; some services
+        echo parts of the request (including bearer tokens) in their 4xx
+        payloads. Keep only the status code and a trimmed URL.
+        """
+        safe_url = url.split("?", 1)[0]
+        return urllib.error.HTTPError(
+            safe_url, exc.code,
+            f"HTTP {exc.code} from {safe_url}",
+            hdrs=None, fp=None,
+        )
 
     # ---- Public API ----
     @abstractmethod
@@ -907,6 +1055,14 @@ def _jira_extract_adf_text(adf) -> str | None:
     return text or None
 
 
+class JiraConfigError(RuntimeError):
+    """Missing or invalid Jira driver configuration."""
+
+
+class JiraPushError(RuntimeError):
+    """Raised when a push is rejected before or by Jira."""
+
+
 class JiraDriver(Driver):
     SCHEME = "jira"
 
@@ -988,16 +1144,52 @@ class JiraDriver(Driver):
         return tasks, [], self._now_iso()
 
     def _paginate(self, jql: str) -> list[dict]:
+        """Paginate over Jira issues.
+
+        K2-01: Jira Cloud deprecated `/rest/api/3/search` in May 2024 in
+        favour of `/rest/api/3/search/jql`. The new endpoint returns
+        `nextPageToken` / `isLast` instead of `startAt` / `total`. We try
+        the new endpoint first; on 410 / 404 we fall back to the legacy
+        shape so self-hosted Jira Data Center instances (which still run
+        the old route) keep working.
+        """
         base = self.config.get("baseUrl") or self.url
         if not base:
             raise NotImplementedError("Jira baseUrl is not configured")
+        base = base.rstrip("/")
         headers = self._auth_header()
+        issues: list[dict] = []
+
+        if self.config.get("searchEndpoint", "jql") == "legacy":
+            return self._paginate_legacy(base, headers, jql)
+
+        next_token: str | None = None
+        while True:
+            qs = f"jql={urllib.parse.quote(jql)}&maxResults=50"
+            if next_token:
+                qs += f"&nextPageToken={urllib.parse.quote(next_token)}"
+            url = f"{base}/rest/api/3/search/jql?{qs}"
+            try:
+                data = self._http_get(url, headers=headers)
+            except urllib.error.HTTPError as exc:
+                if exc.code in (404, 410):
+                    return self._paginate_legacy(base, headers, jql)
+                raise
+            page = data.get("issues") or []
+            issues.extend(page)
+            next_token = data.get("nextPageToken")
+            if data.get("isLast") or not next_token or not page:
+                break
+        return issues
+
+    def _paginate_legacy(self, base: str, headers: dict, jql: str
+                          ) -> list[dict]:
         start_at = 0
         max_results = 50
         issues: list[dict] = []
         while True:
             url = (
-                f"{base.rstrip('/')}/rest/api/3/search"
+                f"{base}/rest/api/3/search"
                 f"?jql={urllib.parse.quote(jql)}"
                 f"&startAt={start_at}&maxResults={max_results}"
             )
@@ -1039,13 +1231,16 @@ class JiraDriver(Driver):
             fields["summary"] = task["title"]
         desc = task.get("description")
         if desc:
+            # K2-03: emit one ADF paragraph per source line, including empty
+            # ones so blank separators survive the round-trip.
             fields["description"] = {
                 "type": "doc",
                 "version": 1,
                 "content": [
                     {"type": "paragraph",
-                     "content": [{"type": "text", "text": line}]}
-                    for line in desc.split("\n") if line != "" or True
+                     "content": [{"type": "text", "text": line}] if line
+                                 else []}
+                    for line in desc.split("\n")
                 ],
             }
         pri = self._PRIORITY_TO_JIRA.get(task.get("priority") or "none")
@@ -1127,18 +1322,27 @@ class JiraDriver(Driver):
                            headers=self._auth_header())
 
 
-class JiraConfigError(RuntimeError):
-    """Missing or invalid Jira driver configuration."""
-
-
-class JiraPushError(RuntimeError):
-    """Raised when a push is rejected before or by Jira."""
-
-
 # ---------- Vikunja ---------------------------------------------------------
 
-_VIKUNJA_PRIORITY_MAP = {1: "critical", 2: "high", 3: "medium", 4: "low", 5: "none"}
-_VIKUNJA_PRIORITY_MAP_INV = {v: k for k, v in _VIKUNJA_PRIORITY_MAP.items()}
+# K2-02: Vikunja's native priority encoding matches the enum in
+# https://vikunja.io/docs/api-reference/#tag/task/paths/~1tasks~1all/get
+#   0 = none, 1 = low, 2 = medium, 3 = high, 4 = urgent, 5 = do now
+# We fold the two highest buckets into "critical" so the unified schema
+# keeps its five-level shape. The inverse map used by push picks 4 for
+# critical (the common "urgent" case); operators who want "do now" can
+# override via priorityMap.
+_VIKUNJA_PRIORITY_MAP = {0: "none", 1: "low", 2: "medium", 3: "high",
+                         4: "critical", 5: "critical"}
+_VIKUNJA_PRIORITY_MAP_INV = {"none": 0, "low": 1, "medium": 2,
+                              "high": 3, "critical": 4}
+
+
+class VikunjaConfigError(RuntimeError):
+    """Missing or invalid Vikunja driver configuration."""
+
+
+class VikunjaPushError(RuntimeError):
+    """Raised when a push is rejected before we even talk to Vikunja."""
 
 
 class VikunjaDriver(Driver):
@@ -1279,14 +1483,6 @@ class VikunjaDriver(Driver):
                            headers=self._auth_header())
 
 
-class VikunjaConfigError(RuntimeError):
-    """Missing or invalid Vikunja driver configuration."""
-
-
-class VikunjaPushError(RuntimeError):
-    """Raised when a push is rejected before we even talk to Vikunja."""
-
-
 # ---------- MS Todo ---------------------------------------------------------
 
 _MSTODO_STATUS_MAP = {
@@ -1294,6 +1490,10 @@ _MSTODO_STATUS_MAP = {
     "completed": "done", "deferred": "todo", "waitingOnOthers": "todo",
 }
 _MSTODO_PRIORITY_MAP = {"high": "high", "normal": "medium", "low": "low"}
+
+
+class MSTodoPushError(RuntimeError):
+    """Raised when a push is rejected before or by MS Todo."""
 
 
 class MSTodoDriver(Driver):
@@ -1354,6 +1554,11 @@ class MSTodoDriver(Driver):
         print(flow.get("message") or
               f"Visit {flow.get('verification_uri')} and enter {flow['user_code']}",
               file=sys.stderr, flush=True)
+        # E2-03: cap the device-code wait so `git fetch` never hangs
+        # indefinitely when the user walks away. Respect the upstream
+        # `expires_in` when present; otherwise fall back to 10 minutes.
+        expires_in = int(flow.get("expires_in") or 600)
+        flow["expires_at"] = expires_in  # msal honors this if supported.
         result = app.acquire_token_by_device_flow(flow)
         if "access_token" not in result:
             raise NotImplementedError(
@@ -1364,8 +1569,15 @@ class MSTodoDriver(Driver):
         return result["access_token"]
 
     def _store_refresh(self, refresh_token: str) -> None:
+        # E2-04: surface write failures so operators don't silently re-do
+        # the device flow every run without understanding why.
         key = f"tasks-remote.{self.remote_name}.refreshToken"
-        write_config_value(key, refresh_token)
+        if not write_config_value(key, refresh_token):
+            print(
+                "git-remote-tasks: warning[msal-persist]: could not save "
+                "refresh token; next run will prompt the device flow again.",
+                file=sys.stderr, flush=True,
+            )
 
     def normalize(self, task: dict, list_name: str | None = None) -> dict:
         t = empty_task()
@@ -1503,11 +1715,31 @@ class MSTodoDriver(Driver):
         )
 
 
-class MSTodoPushError(RuntimeError):
-    """Raised when a push is rejected before or by MS Todo."""
-
-
 # ---------- Notion ----------------------------------------------------------
+
+# Native-looking option names we expect to see in Notion databases. Exact
+# matches are case-insensitive; anything else the user can remap through
+# statusMap / priorityMap.
+_NOTION_STATUS_MAP = {
+    "todo": "todo", "to do": "todo", "to-do": "todo",
+    "not started": "todo", "backlog": "todo",
+    "in progress": "in_progress", "in-progress": "in_progress",
+    "today": "in_progress", "doing": "in_progress",
+    "done": "done", "completed": "done", "shipped": "done",
+    "cancelled": "cancelled", "canceled": "cancelled",
+}
+_NOTION_PRIORITY_MAP = {
+    "critical": "critical", "urgent": "critical", "p0": "critical",
+    "high": "high", "p1": "high",
+    "medium": "medium", "normal": "medium", "p2": "medium",
+    "low": "low", "p3": "low",
+    "lowest": "low",
+}
+
+
+class NotionPushError(RuntimeError):
+    """Raised when a push is rejected before or by Notion."""
+
 
 class NotionDriver(Driver):
     SCHEME = "notion"
@@ -1555,19 +1787,22 @@ class NotionDriver(Driver):
         if title_prop:
             t["title"] = self._text_from_rich(title_prop.get("title") or [])
         wanted = {k: v.lower() for k, v in self._prop_names().items()}
+        status_map = _NOTION_STATUS_MAP
+        priority_map = _NOTION_PRIORITY_MAP
         for name, p in props.items():
             if not isinstance(p, dict):
                 continue
             ptype = p.get("type")
             lname = name.lower()
-            if ptype == "select":
-                val = p.get("select") or {}
+            if ptype in ("select", "status"):
+                key = "select" if ptype == "select" else "status"
+                val = p.get(key) or {}
                 name_val = val.get("name") if val else None
                 if lname == wanted["status"] and name_val:
-                    mapped = _JIRA_STATUS_MAP.get(name_val.lower()) or "todo"
+                    mapped = status_map.get(name_val.lower()) or "todo"
                     t["status"] = self._apply_status_override(name_val, mapped)
                 elif lname == wanted["priority"] and name_val:
-                    mapped_pri = _JIRA_PRIORITY_MAP.get(name_val.lower(), "none")
+                    mapped_pri = priority_map.get(name_val.lower(), "none")
                     t["priority"] = self._apply_priority_override(name_val, mapped_pri)
             elif ptype == "multi_select" and lname == wanted["tags"]:
                 t["tags"] = [m.get("name", "") for m in (p.get("multi_select") or [])]
@@ -1728,10 +1963,6 @@ class NotionDriver(Driver):
         )
 
 
-class NotionPushError(RuntimeError):
-    """Raised when a push is rejected before or by Notion."""
-
-
 SCHEMES: dict[str, type[Driver]] = {
     "jira": JiraDriver,
     "vikunja": VikunjaDriver,
@@ -1841,6 +2072,7 @@ class ProtocolHandler:
             if not nxt or nxt.strip() == "":
                 break
 
+        self._promote_pending_since()
         mode = (self.driver.config.get("sync.mode") or "incremental").lower()
         since = self.driver.config.get("sync.lastFetchAt")
         parent = self._previous_tip()
@@ -1853,29 +2085,80 @@ class ProtocolHandler:
             tasks = self.driver.fetch_all()
             tasks_sorted = sorted(tasks, key=lambda t: t.get("id") or "")
             self._write_fast_import(tasks_sorted, parent=parent)
-            self._persist_since(self.driver._now_iso())
+            self._record_pending_since(self.driver._now_iso(), parent)
             return
 
         changed, deleted_ids, new_since = self.driver.fetch_changed(since)
+        if not changed and not deleted_ids:
+            # P2-02: nothing new — skip the empty commit entirely so
+            # `git log <remote>/main` stays clean of no-op rows.
+            self._record_pending_since(new_since or since, parent)
+            return
         changed_sorted = sorted(changed, key=lambda t: t.get("id") or "")
         self._write_incremental_import(changed_sorted, deleted_ids,
                                         parent=parent)
         if new_since:
-            self._persist_since(new_since)
+            self._record_pending_since(new_since, parent)
 
-    def _persist_since(self, value: str) -> None:
-        """Store the new `sync.lastFetchAt` token in .git/config.
+    def _record_pending_since(self, value: str, parent: str | None) -> None:
+        """Phase 1 of the two-phase sync watermark.
 
-        Best-effort: failure to write just means the next run falls back to
-        a full snapshot, which is correct but expensive. We warn so
-        operators can fix the underlying git-config issue.
+        Writes the new token to `sync.pending.since` together with the
+        parent sha we based the import on. The next run's
+        `_promote_pending_since` promotes this to `sync.lastFetchAt`
+        only if git actually accepted the fast-import stream (the tip
+        moved). If import failed, the pending record is dropped on the
+        next run and the watermark never advances — so tasks are never
+        lost to a crash between our exit and fast-import's.
         """
-        key = f"tasks-remote.{self.remote_name}.sync.lastFetchAt"
-        if not write_config_value(key, value):
+        key_since = f"tasks-remote.{self.remote_name}.sync.pending.since"
+        key_parent = f"tasks-remote.{self.remote_name}.sync.pending.parent"
+        ok = True
+        if not write_config_value(key_since, value):
+            ok = False
+        if not write_config_value(key_parent, parent or ""):
+            ok = False
+        if not ok:
             self._warn_once(
                 "sync-persist",
-                f"failed to persist {key}; next fetch will do a full snapshot.",
+                f"failed to persist pending sync state for {self.remote_name}; "
+                f"next fetch will do a full snapshot.",
             )
+
+    def _promote_pending_since(self) -> None:
+        """Phase 2: check pending watermark and either promote or discard.
+
+        Called at the start of every import batch, before we consult
+        `sync.lastFetchAt`. Promotes the pending token when the current
+        remote tip differs from the parent we recorded — meaning git
+        accepted our last fast-import stream.
+        """
+        pending_since = self.driver.config.get("sync.pending.since")
+        if not pending_since:
+            return
+        pending_parent = self.driver.config.get("sync.pending.parent") or ""
+        current_tip = self._previous_tip() or ""
+        # parent=="" means there was no previous tip (first fetch); in that
+        # case any current_tip counts as success.
+        if current_tip and current_tip != pending_parent:
+            self._commit_pending_since(pending_since)
+        else:
+            self._discard_pending_since()
+
+    def _commit_pending_since(self, value: str) -> None:
+        key = f"tasks-remote.{self.remote_name}.sync.lastFetchAt"
+        write_config_value(key, value)
+        self._discard_pending_since()
+        # Also mirror into the driver's live config so this run's
+        # incremental logic sees the promoted value.
+        self.driver.config["sync.lastFetchAt"] = value
+
+    def _discard_pending_since(self) -> None:
+        unset_config_values(
+            f"^tasks-remote\\.{re.escape(self.remote_name)}\\.sync\\.pending\\."
+        )
+        self.driver.config.pop("sync.pending.since", None)
+        self.driver.config.pop("sync.pending.parent", None)
 
     def _write_fast_import(self, tasks: list[dict],
                            parent: str | None = None) -> None:
@@ -1915,9 +2198,22 @@ class ProtocolHandler:
     def _emit_blobs(self, tasks: list[dict], ext: str
                     ) -> list[tuple[int, bytes, str]]:
         blobs: list[tuple[int, bytes, str]] = []
-        for idx, task in enumerate(tasks, start=1):
+        idx = 0
+        for task in tasks:
+            tid = task.get("id") or ""
+            if not is_safe_task_id(tid):
+                # Refuse to emit an entry that could escape tasks/ or shadow
+                # a git-internal name. The whole task is dropped with a
+                # warning; a single bad row must not abort the import.
+                self._warn_once(
+                    "unsafe-id",
+                    f"skipping task with unsafe id {tid!r}: "
+                    f"must match [A-Za-z0-9][A-Za-z0-9._-]* (≤255 chars).",
+                )
+                continue
+            idx += 1
             body = self.serializer.serialize(task).encode("utf-8")
-            path = f"tasks/{task['id']}.{ext}"
+            path = f"tasks/{tid}.{ext}"
             blobs.append((idx, body, path))
         for mark, body, _path in blobs:
             self._write("blob\n")
@@ -1964,8 +2260,11 @@ class ProtocolHandler:
                 ["git", "rev-parse", "--verify", "--quiet",
                  f"refs/remotes/{self.remote_name}/main"],
                 capture_output=True, text=True, check=False,
+                timeout=_GIT_SUBPROCESS_TIMEOUT,
             )
         except (FileNotFoundError, OSError):
+            return None
+        except subprocess.TimeoutExpired:
             return None
         sha = proc.stdout.strip()
         return sha or None
@@ -2082,6 +2381,16 @@ class ProtocolHandler:
         _, _mode, ref, path = parts
         if not path.startswith("tasks/"):
             return
+        if not _is_safe_tasks_path(path):
+            self._log(f"refusing to push from suspicious path {path!r}")
+            self._record_export_error(current_ref, f"unsafe path: {path}")
+            return
+        basename = Path(path).name
+        task_id_from_path, _dot, _ext = basename.rpartition(".")
+        if not is_safe_task_id(task_id_from_path):
+            self._log(f"refusing to push unsafe task id from path {path!r}")
+            self._record_export_error(current_ref, f"unsafe path: {path}")
+            return
         try:
             serializer = serializer_for_extension(path)
         except ValueError as exc:
@@ -2120,8 +2429,16 @@ class ProtocolHandler:
         path = parts[1]
         if not path.startswith("tasks/"):
             return
+        if not _is_safe_tasks_path(path):
+            self._log(f"refusing to delete from suspicious path {path!r}")
+            self._record_export_error(current_ref, f"unsafe path: {path}")
+            return
         name = Path(path).name
         task_id, _, _ = name.rpartition(".")
+        if not is_safe_task_id(task_id):
+            self._log(f"refusing to delete unsafe task id from path {path!r}")
+            self._record_export_error(current_ref, f"unsafe path: {path}")
+            return
         try:
             self.driver.delete(task_id)
         except NotImplementedError as exc:
@@ -2145,7 +2462,10 @@ class ProtocolHandler:
 # Management subcommands
 # ============================================================================
 
-KNOWN_SUBCOMMANDS = {"install", "uninstall", "list-schemes", "check", "init"}
+KNOWN_SUBCOMMANDS = {"install", "uninstall", "list-schemes", "check",
+                      "init", "reset", "version"}
+
+__version__ = "0.2.0"
 
 INIT_SYMLINK_NAMES = ("tasks-init",)
 
@@ -2223,12 +2543,44 @@ def cmd_list_schemes(args) -> int:
     return 0
 
 
-def _prompt_format(input_fn=input) -> str:
+def _prompt_format(input_fn=input, stdin=None) -> str:
+    """Prompt the user for yaml|org, refusing non-interactive stdin.
+
+    UX2-02: `input()` on a piped stdin hangs forever. If we can't
+    interact, fail loudly with a clear message rather than block the
+    user's terminal.
+    """
+    source = stdin if stdin is not None else sys.stdin
+    if input_fn is input:
+        # Real TTY check — mocks bypass this with a fake input_fn.
+        if not hasattr(source, "isatty") or not source.isatty():
+            raise RuntimeError(
+                "tasks-init: --format must be given explicitly when stdin "
+                "is not a terminal."
+            )
     while True:
         choice = input_fn("Choose task file format [yaml/org]: ").strip()
         if choice in ("yaml", "org"):
             return choice
         print("  → please enter 'yaml' or 'org'.")
+
+
+def cmd_version(args) -> int:
+    print(f"git-remote-tasks {__version__}")
+    return 0
+
+
+def cmd_reset(args) -> int:
+    """Wipe sync state for a remote so the next fetch does a full snapshot."""
+    name = args.remote_name
+    pattern = f"^tasks-remote\\.{re.escape(name)}\\.sync\\."
+    ok = unset_config_values(pattern)
+    if ok:
+        print(f"reset sync state for remote {name!r}")
+        return 0
+    print(f"tasks-init: failed to reset some sync keys for {name!r}",
+          file=sys.stderr)
+    return 1
 
 
 def cmd_init(args) -> int:
@@ -2388,6 +2740,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p_init.add_argument("path", nargs="?", default=None,
                         help="target directory (created if missing); defaults to cwd")
 
+    p_reset = sub.add_parser(
+        "reset",
+        help="wipe tasks-remote.<name>.sync.* state so the next fetch is full",
+    )
+    p_reset.add_argument("remote_name")
+
+    sub.add_parser("version", help="print the git-remote-tasks version")
+
     return parser
 
 
@@ -2429,6 +2789,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_check(args)
         if args.cmd == "init":
             return cmd_init(args)
+        if args.cmd == "reset":
+            return cmd_reset(args)
+        if args.cmd == "version":
+            return cmd_version(args)
         return 2
 
     # Case 3: direct invocation as helper (scheme from URL)

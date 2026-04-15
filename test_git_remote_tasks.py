@@ -361,6 +361,353 @@ class TestBug06YamlHyphenKeys(unittest.TestCase):
         self.assertEqual(parsed["category"]["extra-key"], "val")
 
 
+class TestSafeTaskId(unittest.TestCase):
+    """S2-01: path-traversal and filesystem-name guards."""
+
+    def test_happy_paths(self):
+        for ok_id in ("jira-PROJ-1", "vikunja-42", "notion-abc-def",
+                       "msftodo-AAAAAA_BBB", "a", "z9", "a.b-c_d"):
+            self.assertTrue(grt.is_safe_task_id(ok_id),
+                             f"should be safe: {ok_id!r}")
+
+    def test_rejected(self):
+        for bad in ("", ".", "..", "../foo", "foo/bar", "foo\\bar",
+                     ".hidden", "-leading", "has space",
+                     "bell\x07", "tab\t", "newline\n"):
+            self.assertFalse(grt.is_safe_task_id(bad),
+                              f"should be unsafe: {bad!r}")
+
+    def test_too_long(self):
+        self.assertTrue(grt.is_safe_task_id("a" * 255))
+        self.assertFalse(grt.is_safe_task_id("a" * 256))
+
+
+class TestEmitBlobsSkipsUnsafeIds(unittest.TestCase):
+    def test_unsafe_id_is_dropped_with_warning(self):
+        class D(FakeDriver):
+            pass
+        good = grt.empty_task() | {"id": "fake-safe", "source": "fake",
+                                     "title": "ok"}
+        bad = grt.empty_task() | {"id": "../../evil", "source": "fake",
+                                    "title": "nope"}
+        h = grt.ProtocolHandler("fake", "fake://x", D(tasks=[good, bad]),
+                                 grt.YAMLSerializer(),
+                                 stdin=io.StringIO("import refs/heads/main\n\n"),
+                                 stdout=FlushTrackingStringIO(),
+                                 stderr=io.StringIO())
+        h.run()
+        out = h.stdout.getvalue()
+        self.assertIn("tasks/fake-safe.yaml", out)
+        self.assertNotIn("evil", out)
+        self.assertIn("warning[unsafe-id]", h.stderr.getvalue())
+
+
+class TestPushRejectsUnsafePaths(unittest.TestCase):
+    def test_handle_modify_rejects_traversal_path(self):
+        stream = (
+            "export\n"
+            "commit refs/heads/main\n"
+            "blob\nmark :1\ndata 3\nhey\n"
+            "M 100644 :1 tasks/../../etc/passwd.yaml\n"
+            "\ndone\n"
+        )
+        driver = FakeDriver()
+        h = grt.ProtocolHandler("fake", "fake://x", driver,
+                                 grt.YAMLSerializer(),
+                                 stdin=io.StringIO(stream),
+                                 stdout=FlushTrackingStringIO(),
+                                 stderr=io.StringIO())
+        h.run()
+        self.assertEqual(driver.upserted, [])
+        err = h.stderr.getvalue().lower()
+        self.assertTrue("unsafe" in err or "suspicious" in err, err)
+
+    def test_handle_delete_rejects_traversal_path(self):
+        stream = (
+            "export\n"
+            "commit refs/heads/main\n"
+            "D tasks/../../etc/passwd.yaml\n"
+            "\ndone\n"
+        )
+        driver = FakeDriver()
+        h = grt.ProtocolHandler("fake", "fake://x", driver,
+                                 grt.YAMLSerializer(),
+                                 stdin=io.StringIO(stream),
+                                 stdout=FlushTrackingStringIO(),
+                                 stderr=io.StringIO())
+        h.run()
+        self.assertEqual(driver.deleted, [])
+        err = h.stderr.getvalue().lower()
+        self.assertTrue("unsafe" in err or "suspicious" in err, err)
+
+
+class TestHttpRetryAndTimeout(unittest.TestCase):
+    def setUp(self):
+        self.d = grt.JiraDriver("jira", "https://x", {})
+
+    def test_retries_on_5xx_then_succeeds(self):
+        calls = []
+        class FakeResp:
+            def __init__(self, body=b'{"ok":1}'):
+                self._b = body
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self): return self._b
+        def urlopen(req, timeout=None):
+            calls.append(1)
+            if len(calls) < 3:
+                raise urllib.error.HTTPError(
+                    "https://x/api", 503, "Service Unavailable",
+                    hdrs=None, fp=None,
+                )
+            return FakeResp()
+        with mock.patch.object(grt.urllib.request, "urlopen", urlopen), \
+                mock.patch.object(grt.Driver, "_sleep_backoff",
+                                    staticmethod(lambda s: None)):
+            out = self.d._http_request("GET", "https://x/api")
+        self.assertEqual(out, {"ok": 1})
+        self.assertEqual(len(calls), 3)
+
+    def test_gives_up_after_max_retries(self):
+        def urlopen(req, timeout=None):
+            raise urllib.error.HTTPError("https://x", 500, "boom",
+                                          hdrs=None, fp=None)
+        with mock.patch.object(grt.urllib.request, "urlopen", urlopen), \
+                mock.patch.object(grt.Driver, "_sleep_backoff",
+                                    staticmethod(lambda s: None)):
+            with self.assertRaises(urllib.error.HTTPError):
+                self.d._http_request("GET", "https://x/api")
+
+    def test_non_retryable_status_raises_immediately(self):
+        calls = []
+        def urlopen(req, timeout=None):
+            calls.append(1)
+            raise urllib.error.HTTPError("https://x", 404, "not found",
+                                          hdrs=None, fp=None)
+        with mock.patch.object(grt.urllib.request, "urlopen", urlopen), \
+                mock.patch.object(grt.Driver, "_sleep_backoff",
+                                    staticmethod(lambda s: None)):
+            with self.assertRaises(urllib.error.HTTPError):
+                self.d._http_request("GET", "https://x/api")
+        self.assertEqual(len(calls), 1)
+
+    def test_retries_on_urlerror(self):
+        calls = []
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self): return b"{}"
+        def urlopen(req, timeout=None):
+            calls.append(1)
+            if len(calls) < 2:
+                raise urllib.error.URLError("network down")
+            return FakeResp()
+        with mock.patch.object(grt.urllib.request, "urlopen", urlopen), \
+                mock.patch.object(grt.Driver, "_sleep_backoff",
+                                    staticmethod(lambda s: None)):
+            self.d._http_request("GET", "https://x/api")
+        self.assertEqual(len(calls), 2)
+
+    def test_redaction_scrubs_query_string(self):
+        def urlopen(req, timeout=None):
+            raise urllib.error.HTTPError("https://x/api?token=leak", 400,
+                                          "bad", hdrs=None, fp=None)
+        with mock.patch.object(grt.urllib.request, "urlopen", urlopen):
+            try:
+                self.d._http_request("GET", "https://x/api?token=leak")
+            except urllib.error.HTTPError as exc:
+                self.assertNotIn("token=leak", str(exc))
+                self.assertNotIn("token=leak", exc.msg)
+
+    def test_timeout_is_configurable(self):
+        self.d.config["httpTimeout"] = "7"
+        captured = {}
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self): return b"{}"
+        def urlopen(req, timeout=None):
+            captured["t"] = timeout
+            return FakeResp()
+        with mock.patch.object(grt.urllib.request, "urlopen", urlopen):
+            self.d._http_request("GET", "https://x/api")
+        self.assertEqual(captured["t"], 7.0)
+
+
+class TestWriteConfigRejectsNewline(unittest.TestCase):
+    def test_newline_in_value_refused(self):
+        with mock.patch.object(subprocess, "run") as run, \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            self.assertFalse(grt.write_config_value("k", "line1\nline2"))
+        run.assert_not_called()
+
+
+class TestTwoPhaseSyncWatermark(unittest.TestCase):
+    def _driver(self, **cfg) -> IncrementalFakeDriver:
+        d = IncrementalFakeDriver(changed=[self._task("fake-x")])
+        d.config = dict(cfg)
+        return d
+
+    def _task(self, tid):
+        t = grt.empty_task()
+        t.update(id=tid, source="fake", title=tid,
+                 updated_date="2026-04-16T10:00:00Z")
+        return t
+
+    def test_pending_promoted_when_tip_advanced(self):
+        """Second fetch: previous import landed → promote pending.since."""
+        d = self._driver(**{
+            "sync.mode": "incremental",
+            "sync.pending.since": "2026-04-16T00:00:00Z",
+            "sync.pending.parent": "oldparent",
+            "sync.lastFetchAt": "2026-04-15T00:00:00Z",
+        })
+        captured: dict[str, str] = {}
+        def fake_run(cmd, *args, **kwargs):
+            if "rev-parse" in cmd:
+                return mock.Mock(returncode=0, stdout="newtip\n", stderr="")
+            if "config" in cmd and "--unset-all" in cmd:
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            if "--get-regexp" in cmd:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=(f"tasks-remote.fake.sync.pending.since "
+                             "2026-04-16T00:00:00Z\n"
+                             "tasks-remote.fake.sync.pending.parent "
+                             "oldparent\n"),
+                    stderr="",
+                )
+            if "config" in cmd:
+                # Key/value writes.
+                if len(cmd) >= 5:
+                    captured[cmd[3]] = cmd[4]
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        h = make_handler(driver=d,
+                         stdin_text="import refs/heads/main\n\n")
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            h.run()
+        self.assertEqual(
+            captured.get("tasks-remote.fake.sync.lastFetchAt"),
+            "2026-04-16T00:00:00Z",
+            "pending watermark must be promoted when the tip advanced",
+        )
+
+    def test_pending_discarded_when_tip_unchanged(self):
+        """Previous import failed → discard pending, keep lastFetchAt."""
+        d = self._driver(**{
+            "sync.mode": "incremental",
+            "sync.pending.since": "2026-04-16T00:00:00Z",
+            "sync.pending.parent": "sametip",
+            "sync.lastFetchAt": "2026-04-15T00:00:00Z",
+        })
+        set_keys: dict[str, str] = {}
+        unsets: list[str] = []
+        def fake_run(cmd, *args, **kwargs):
+            if "rev-parse" in cmd:
+                return mock.Mock(returncode=0, stdout="sametip\n", stderr="")
+            if "--unset-all" in cmd:
+                unsets.append(cmd[-1])
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            if "--get-regexp" in cmd:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=(f"tasks-remote.fake.sync.pending.since "
+                             "2026-04-16T00:00:00Z\n"
+                             "tasks-remote.fake.sync.pending.parent "
+                             "sametip\n"),
+                    stderr="",
+                )
+            if "config" in cmd and len(cmd) >= 5:
+                set_keys[cmd[3]] = cmd[4]
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        h = make_handler(driver=d,
+                         stdin_text="import refs/heads/main\n\n")
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            h.run()
+        # lastFetchAt never advanced to the pending value.
+        self.assertNotEqual(set_keys.get("tasks-remote.fake.sync.lastFetchAt"),
+                             "2026-04-16T00:00:00Z")
+        self.assertTrue(any("sync.pending" in k for k in unsets),
+                         "pending keys must be unset when import failed")
+
+
+class TestEmptyDeltaNoCommit(unittest.TestCase):
+    def test_no_changes_no_deletes_emits_no_commit(self):
+        driver = IncrementalFakeDriver(changed=[], deleted=[])
+        driver.config = {
+            "sync.mode": "incremental",
+            "sync.lastFetchAt": "2026-04-15T00:00:00Z",
+        }
+        def fake_run(cmd, *args, **kwargs):
+            if "rev-parse" in cmd:
+                return mock.Mock(returncode=0, stdout="a" * 40 + "\n",
+                                  stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        h = make_handler(driver=driver,
+                         stdin_text="import refs/heads/main\n\n")
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            h.run()
+        out = h.stdout.getvalue()
+        self.assertNotIn("commit refs/heads/main", out,
+                          "empty delta must not produce a commit")
+
+
+class TestResetSubcommand(unittest.TestCase):
+    def test_reset_unsets_all_sync_keys(self):
+        args = mock.Mock(remote_name="jira-work")
+        def fake_run(cmd, *args, **kwargs):
+            if "--get-regexp" in cmd:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=(
+                        "tasks-remote.jira-work.sync.lastFetchAt 2025-01-01\n"
+                        "tasks-remote.jira-work.sync.pending.since x\n"
+                    ),
+                    stderr="",
+                )
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(subprocess, "run",
+                                side_effect=fake_run) as run, \
+                mock.patch.object(sys, "stdout", io.StringIO()):
+            rc = grt.cmd_reset(args)
+        self.assertEqual(rc, 0)
+        unsets = [c for c in run.call_args_list
+                  if "--unset-all" in (c[0][0] if c[0] else [])]
+        self.assertEqual(len(unsets), 2)
+
+
+class TestVersion(unittest.TestCase):
+    def test_version_subcommand_prints(self):
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stdout", buf):
+            rc = grt.cmd_version(mock.Mock())
+        self.assertEqual(rc, 0)
+        self.assertIn("git-remote-tasks", buf.getvalue())
+        self.assertIn(grt.__version__, buf.getvalue())
+
+
+class TestPromptFormatNonTty(unittest.TestCase):
+    def test_non_tty_raises(self):
+        class FakeStdin:
+            def isatty(self): return False
+        with self.assertRaises(RuntimeError):
+            grt._prompt_format(stdin=FakeStdin())
+
+
+class TestJiraAdfK203(unittest.TestCase):
+    def test_multiline_description_keeps_all_paragraphs(self):
+        d = grt.JiraDriver("jira", "https://x", {"baseUrl": "https://x",
+                                                  "email": "a", "apiToken": "t"})
+        fields = d._serialize_for_push({"title": "t", "status": "todo",
+                                         "priority": "none",
+                                         "description": "one\n\nthree"})
+        paras = fields["description"]["content"]
+        self.assertEqual(len(paras), 3)
+        # Middle paragraph is an intentional blank line — empty content array.
+        self.assertEqual(paras[1]["content"], [])
+
+
 # ---------------------------------------------------------------------------
 # Symmetry
 # ---------------------------------------------------------------------------
@@ -662,17 +1009,40 @@ class TestJiraDriver(unittest.TestCase):
         t = self.d.normalize(self._issue())
         self.assertEqual(t["url"], "https://x/y/browse/PROJ-1")
 
-    def test_fetch_all_paginates(self):
+    def test_fetch_all_paginates_new_endpoint(self):
+        """K2-01: /rest/api/3/search/jql response uses nextPageToken."""
         calls = []
         def fake_get(url, headers=None):
             calls.append(url)
-            if "startAt=0" in url:
-                return {"issues": [self._issue()], "total": 2}
-            return {"issues": [self._issue()], "total": 2}
+            if "nextPageToken" not in url:
+                return {"issues": [self._issue()],
+                         "nextPageToken": "tok2", "isLast": False}
+            return {"issues": [self._issue()], "isLast": True}
         with mock.patch.object(self.d, "_http_get", side_effect=fake_get):
             tasks = self.d.fetch_all()
         self.assertEqual(len(tasks), 2)
         self.assertEqual(len(calls), 2)
+        self.assertTrue(all("/rest/api/3/search/jql?" in c for c in calls))
+
+    def test_fetch_all_falls_back_to_legacy_on_410(self):
+        """K2-01: Data Center Jira still serves the legacy route."""
+        legacy_calls = []
+        def fake_get(url, headers=None):
+            if "/search/jql" in url:
+                raise urllib.error.HTTPError(url, 410, "Gone", hdrs=None, fp=None)
+            legacy_calls.append(url)
+            return {"issues": [self._issue()], "total": 1, "startAt": 0}
+        with mock.patch.object(self.d, "_http_get", side_effect=fake_get):
+            tasks = self.d.fetch_all()
+        self.assertEqual(len(tasks), 1)
+        self.assertTrue(any("/search?jql" in c for c in legacy_calls))
+
+    def test_fetch_all_legacy_opt_in(self):
+        self.d.config["searchEndpoint"] = "legacy"
+        with mock.patch.object(self.d, "_http_get",
+                                return_value={"issues": [], "total": 0}) as hg:
+            self.d.fetch_all()
+        self.assertIn("/search?jql", hg.call_args[0][0])
 
     def test_fetch_all_no_base_url(self):
         d = grt.JiraDriver("jira", "", {})
@@ -753,11 +1123,25 @@ class TestVikunjaDriver(unittest.TestCase):
                                    {"baseUrl": "http://localhost:3456",
                                     "apiToken": "tok"})
 
-    def test_priority_map(self):
-        expected = {1: "critical", 2: "high", 3: "medium", 4: "low", 5: "none"}
+    def test_priority_map_native_encoding(self):
+        """K2-02: Vikunja's native encoding is 0..5, not our earlier inversion."""
+        expected = {0: "none", 1: "low", 2: "medium", 3: "high",
+                    4: "critical", 5: "critical"}
         for p, u in expected.items():
             t = self.d.normalize({"id": 1, "title": "x", "priority": p})
-            self.assertEqual(t["priority"], u)
+            self.assertEqual(t["priority"], u, f"priority={p}")
+
+    def test_priority_push_inverse(self):
+        """critical/high/... → 4/3/... on push (round-trip with the new map)."""
+        for unified, expected in (("none", 0), ("low", 1), ("medium", 2),
+                                   ("high", 3), ("critical", 4)):
+            with mock.patch.object(self.d, "_http_post") as post:
+                self.d.upsert(full_task(id="vikunja-1",
+                                         priority=unified,
+                                         title="x"))
+            body = post.call_args[1]["body"]
+            self.assertEqual(body["priority"], expected,
+                              f"priority={unified}")
 
     def test_done_true_to_done(self):
         t = self.d.normalize({"id": 1, "title": "x", "done": True})
@@ -825,8 +1209,8 @@ class TestVikunjaDriver(unittest.TestCase):
         self.assertTrue(url.endswith("/api/v1/tasks/42"))
         self.assertEqual(body["title"], "hello")
         self.assertTrue(body["done"])
-        # high → 2 with the existing map
-        self.assertEqual(body["priority"], 2)
+        # K2-02: high → 3 under the corrected native encoding.
+        self.assertEqual(body["priority"], 3)
         self.assertEqual(body["due_date"], "2025-05-01T00:00:00Z")
         put.assert_not_called()
 
@@ -2075,10 +2459,11 @@ class TestHttpWiring(unittest.TestCase):
             def __enter__(self): return self
             def __exit__(self, *a): pass
             def read(self): return b'{"ok":true}'
-        def fake_urlopen(req):
+        def fake_urlopen(req, timeout=None):
             captured["method"] = req.get_method()
             captured["url"] = req.full_url
             captured["data"] = req.data
+            captured["timeout"] = timeout
             return FakeResp()
         with mock.patch.object(grt.urllib.request, "urlopen", fake_urlopen):
             result = d._http_request("POST", "https://x/api",
@@ -2087,6 +2472,8 @@ class TestHttpWiring(unittest.TestCase):
         self.assertEqual(result, {"ok": True})
         self.assertEqual(captured["method"], "POST")
         self.assertIn(b'"k"', captured["data"])
+        self.assertEqual(captured["timeout"],
+                          grt.Driver.HTTP_TIMEOUT_DEFAULT)
 
 
 # ---------------------------------------------------------------------------
