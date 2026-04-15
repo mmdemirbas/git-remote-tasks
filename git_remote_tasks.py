@@ -1507,11 +1507,120 @@ class NotionDriver(Driver):
             cursor = data.get("next_cursor")
         return results
 
+    # ---- Push ----
+    _NOTION_BASE = "https://api.notion.com/v1"
+    _STATUS_TO_NOTION = {
+        "todo": "To Do", "in_progress": "In Progress",
+        "done": "Done", "cancelled": "Cancelled",
+    }
+    _PRIORITY_TO_NOTION = {
+        "critical": "Critical", "high": "High", "medium": "Medium",
+        "low": "Low", "none": None,
+    }
+
+    def _discover_title_prop(self, database_id: str, headers: dict) -> str:
+        """Return the name of the `title` column in the target database.
+
+        The title property is required when creating a page; its name
+        varies per database ("Name", "Task", ...). We cache the result
+        on the driver instance so repeated upserts in one run hit the
+        network once.
+        """
+        cached = getattr(self, "_title_prop_name", None)
+        if cached:
+            return cached
+        data = self._http_get(
+            f"{self._NOTION_BASE}/databases/{database_id}",
+            headers=headers,
+        )
+        for name, prop in (data.get("properties") or {}).items():
+            if isinstance(prop, dict) and prop.get("type") == "title":
+                self._title_prop_name = name
+                return name
+        raise NotionPushError(
+            f"Notion database {database_id} has no title property"
+        )
+
+    def _build_properties(self, task: dict, title_prop: str) -> dict:
+        """Render a unified task into Notion's properties shape."""
+        props: dict = {
+            title_prop: {
+                "title": [{"type": "text",
+                            "text": {"content": task.get("title") or ""}}]
+            }
+        }
+        status = self._STATUS_TO_NOTION.get(task.get("status") or "todo")
+        if status:
+            props["Status"] = {"select": {"name": status}}
+        pri = self._PRIORITY_TO_NOTION.get(task.get("priority") or "none")
+        if pri:
+            props["Priority"] = {"select": {"name": pri}}
+        if task.get("tags"):
+            props["Tags"] = {
+                "multi_select": [{"name": t} for t in task["tags"]]
+            }
+        if task.get("due_date"):
+            props["Due"] = {"date": {"start": task["due_date"]}}
+        desc = task.get("description")
+        if desc:
+            props["Description"] = {
+                "rich_text": [{"type": "text",
+                                "text": {"content": desc}}]
+            }
+        return props
+
     def upsert(self, task: dict) -> None:
-        raise NotImplementedError("Notion is pull-only")
+        database_id = self.config.get("databaseId")
+        if not database_id:
+            raise NotionPushError("Notion databaseId is not configured")
+        headers = self._auth_header()
+        headers["Content-Type"] = "application/json"
+        title_prop = self._discover_title_prop(database_id, headers)
+        props = self._build_properties(task, title_prop)
+        native = self._native_id(task.get("id") or "")
+        if native:
+            # Update existing page. Notion PATCH on /pages/{id} expects
+            # { "properties": {...} } and optionally { "archived": false }.
+            pid = urllib.parse.quote(native, safe="")
+            self._http_patch(
+                f"{self._NOTION_BASE}/pages/{pid}",
+                body={"properties": props, "archived": False},
+                headers=headers,
+            )
+            return
+        # Create new page in the target database.
+        self._http_post(
+            f"{self._NOTION_BASE}/pages",
+            body={
+                "parent": {"database_id": database_id},
+                "properties": props,
+            },
+            headers=headers,
+        )
 
     def delete(self, task_id: str) -> None:
-        raise NotImplementedError("Notion is pull-only")
+        """Notion has no hard-delete in the public API — archive instead.
+
+        Archived pages are filtered out of normal queries, so this matches
+        the behaviour git users expect from `git rm` + push.
+        """
+        native = self._native_id(task_id)
+        if not native:
+            raise NotionPushError(
+                f"cannot delete {task_id!r}: not a Notion-sourced id"
+            )
+        headers = self._auth_header()
+        headers["Content-Type"] = "application/json"
+        pid = urllib.parse.quote(native, safe="")
+        self._http_patch(
+            f"{self._NOTION_BASE}/pages/{pid}",
+            body={"archived": True},
+            headers=headers,
+        )
+
+
+class NotionPushError(RuntimeError):
+    """Raised when a push is rejected before or by Notion."""
 
 
 SCHEMES: dict[str, type[Driver]] = {

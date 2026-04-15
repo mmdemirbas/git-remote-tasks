@@ -240,8 +240,12 @@ git config tasks-remote.jira-work.sync.mode incremental
    git config tasks-remote.notion-inbox.token        "$INTEGRATION_TOKEN"
    ```
 
-Notion is **pull-only**: `git push` to a Notion remote fails with a clear
-message. Edits propagate through the Notion UI.
+Notion push is supported: `git push` creates pages via
+`POST /v1/pages`, updates existing pages via `PATCH /v1/pages/{id}`, and
+soft-deletes by archiving (`PATCH archived: true`). The title column's
+name is auto-discovered via the database schema; `Status`, `Priority`,
+`Tags`, `Due`, and `Description` are the expected property names unless
+overridden through `fieldMap.*` config keys (see §7.2 mapping).
 
 ## 9. How it works
 

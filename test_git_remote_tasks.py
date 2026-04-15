@@ -943,13 +943,66 @@ class TestNotionDriver(unittest.TestCase):
         self.assertEqual(t["category"], {"id": "abc", "name": "Inbox",
                                          "type": "database"})
 
-    def test_upsert_raises(self):
-        with self.assertRaises(NotImplementedError):
-            self.d.upsert({})
+    def test_upsert_update_existing_patches_page(self):
+        def fake_get(url, headers=None):
+            return {"properties": {"Name": {"type": "title"}}}
+        patches = []
+        def fake_patch(url, body=None, headers=None):
+            patches.append((url, body))
+            return {}
+        task = full_task(id="notion-abc123", source="notion", title="Hello",
+                         priority="high", tags=["a", "b"])
+        with mock.patch.object(self.d, "_http_get", side_effect=fake_get), \
+                mock.patch.object(self.d, "_http_patch", side_effect=fake_patch):
+            self.d.upsert(task)
+        url, body = patches[0]
+        self.assertTrue(url.endswith("/pages/abc123"))
+        self.assertIn("Name", body["properties"])
+        self.assertEqual(body["properties"]["Priority"]["select"]["name"], "High")
+        self.assertEqual(body["archived"], False)
 
-    def test_delete_raises(self):
-        with self.assertRaises(NotImplementedError):
-            self.d.delete("notion-1")
+    def test_upsert_create_posts_new_page(self):
+        def fake_get(url, headers=None):
+            return {"properties": {"Task": {"type": "title"}}}
+        posts = []
+        def fake_post(url, body=None, headers=None):
+            posts.append((url, body))
+            return {"id": "new-page"}
+        task = full_task(id="", title="Fresh", status="todo", priority="low")
+        with mock.patch.object(self.d, "_http_get", side_effect=fake_get), \
+                mock.patch.object(self.d, "_http_post", side_effect=fake_post):
+            self.d.upsert(task)
+        url, body = posts[0]
+        self.assertTrue(url.endswith("/v1/pages"))
+        self.assertEqual(body["parent"], {"database_id": "abc"})
+        self.assertIn("Task", body["properties"])
+
+    def test_upsert_refuses_without_database(self):
+        self.d.config = {}
+        with self.assertRaises(grt.NotionPushError):
+            self.d.upsert(full_task(id=""))
+
+    def test_upsert_refuses_when_title_property_missing(self):
+        with mock.patch.object(self.d, "_http_get",
+                                return_value={"properties": {
+                                    "Status": {"type": "select"}}}):
+            with self.assertRaises(grt.NotionPushError):
+                self.d.upsert(full_task(id=""))
+
+    def test_delete_archives_page(self):
+        patches = []
+        def fake_patch(url, body=None, headers=None):
+            patches.append((url, body))
+            return {}
+        with mock.patch.object(self.d, "_http_patch", side_effect=fake_patch):
+            self.d.delete("notion-abc123")
+        url, body = patches[0]
+        self.assertTrue(url.endswith("/pages/abc123"))
+        self.assertEqual(body, {"archived": True})
+
+    def test_delete_refuses_cross_source(self):
+        with self.assertRaises(grt.NotionPushError):
+            self.d.delete("jira-PROJ-1")
 
     def test_fetch_all_paginates(self):
         responses = [
