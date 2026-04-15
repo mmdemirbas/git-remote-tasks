@@ -113,6 +113,24 @@ def _is_safe_tasks_path(path: str) -> bool:
     return True
 
 
+_TASK_FILE_EXTS = (".yaml", ".yml", ".org")
+
+
+def _is_task_file_path(path: str) -> bool:
+    """Return True only for `tasks/<anything>.<yaml|yml|org>`.
+
+    Task repos often carry companion files under `tasks/` — `.gitkeep` to
+    keep the directory in git, `README.md` for contributors. Neither is a
+    task. During an export we silently skip any path that does not have a
+    serializable extension so those companions do not trigger the
+    safety-path rejection.
+    """
+    if not path.startswith("tasks/"):
+        return False
+    lower = path.lower()
+    return any(lower.endswith(ext) for ext in _TASK_FILE_EXTS)
+
+
 def is_safe_task_id(task_id: str) -> bool:
     """Return True when task_id can safely become a filesystem basename.
 
@@ -2400,6 +2418,35 @@ def scheme_for_name(argv0: str) -> str | None:
 # Protocol handler
 # ============================================================================
 
+class _BinaryStdinReader:
+    """Text-like shim over a binary stream that does not buffer reads.
+
+    `sys.stdin` is a `TextIOWrapper`, which fills an internal decode buffer
+    on `readline()` — bytes that then become invisible to a subsequent
+    `sys.stdin.buffer.read(n)`. Fast-export streams interleave text
+    directives (`blob`, `data N`) with raw binary blob bodies, so the
+    decode buffer eats into blob bytes and the parser desyncs.
+
+    This shim reads everything through the binary layer: `readline()`
+    decodes a single line, `read(n)` returns exactly n bytes via the
+    `.buffer` property. No second layer of buffering.
+    """
+
+    def __init__(self, binary):
+        self._bin = binary
+
+    def readline(self) -> str:
+        return self._bin.readline().decode("utf-8", errors="replace")
+
+    def read(self, n: int) -> str:
+        # Kept for parity with TextIO; the export path reads via .buffer.
+        return self._bin.read(n).decode("utf-8", errors="replace")
+
+    @property
+    def buffer(self):
+        return self._bin
+
+
 class ProtocolHandler:
     """Drives the git remote helper stdin/stdout conversation."""
 
@@ -2410,7 +2457,15 @@ class ProtocolHandler:
         self.url = url
         self.driver = driver
         self.serializer = serializer
-        self.stdin = stdin if stdin is not None else sys.stdin
+        # When no stdin is passed, wrap sys.stdin.buffer in a byte-accurate
+        # reader. Mixing TextIOWrapper.readline() with stdin.buffer.read(n)
+        # desyncs the stream because TextIOWrapper keeps an internal decode
+        # buffer that read() on the raw buffer skips past — see the
+        # fast-export blob-length regression test.
+        if stdin is None:
+            self.stdin = _BinaryStdinReader(sys.stdin.buffer)
+        else:
+            self.stdin = stdin
         self.stdout = stdout if stdout is not None else sys.stdout
         self.stderr = stderr if stderr is not None else sys.stderr
         # Per-ref failure messages collected during an export. Populated by
@@ -2463,9 +2518,12 @@ class ProtocolHandler:
     def _cmd_capabilities(self) -> None:
         self._write("import\n")
         self._write("export\n")
-        self._write(f"refspec refs/heads/*:refs/remotes/{self.remote_name}/*\n")
-        self._write("*push\n")
-        self._write("*fetch\n")
+        # Private namespace: git redirects the helper's writes here, then
+        # the user's remote fetch refspec maps them to refs/remotes/<name>/*.
+        # Writing directly to refs/heads/* would clobber the user's branches.
+        self._write(
+            f"refspec refs/heads/*:refs/tasks/{self.remote_name}/heads/*\n"
+        )
         self._write("\n")
 
     # ---- list ----
@@ -2649,7 +2707,7 @@ class ProtocolHandler:
             f"[{latest.strftime('%Y-%m-%dT%H:%M:%SZ')}]"
         )
         mbytes = message.encode("utf-8")
-        self._write(f"commit refs/heads/main\n")
+        self._write(f"commit refs/tasks/{self.remote_name}/heads/main\n")
         self._write(f"mark :{commit_mark}\n")
         self._write(f"committer git-remote-tasks <tasks@local> {ts} +0000\n")
         self._write(f"data {len(mbytes)}\n")
@@ -2790,6 +2848,12 @@ class ProtocolHandler:
         _, _mode, ref, path = parts
         if not path.startswith("tasks/"):
             return
+        # Non-task companion files (e.g. tasks/.gitkeep, tasks/README.md)
+        # are legitimately committed alongside task files. Silently skip
+        # anything whose extension we don't serialize, so the safety check
+        # never sees them and the push succeeds.
+        if not _is_task_file_path(path):
+            return
         if not _is_safe_tasks_path(path):
             self._log(f"refusing to push from suspicious path {path!r}")
             self._record_export_error(current_ref, f"unsafe path: {path}")
@@ -2837,6 +2901,10 @@ class ProtocolHandler:
             return
         path = parts[1]
         if not path.startswith("tasks/"):
+            return
+        # See _handle_modify: non-task companions under tasks/ are skipped
+        # silently rather than failing the push.
+        if not _is_task_file_path(path):
             return
         if not _is_safe_tasks_path(path):
             self._log(f"refusing to delete from suspicious path {path!r}")

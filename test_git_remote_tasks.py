@@ -968,6 +968,21 @@ class TestSafeTaskId(unittest.TestCase):
         self.assertFalse(grt.is_safe_task_id("a" * 256))
 
 
+class TestTaskFilePath(unittest.TestCase):
+    """`_is_task_file_path` decides what a push treats as a real task file."""
+
+    def test_task_file_extensions_accepted(self):
+        for ok in ("tasks/jira-X.yaml", "tasks/v-1.yml", "tasks/n-x.org",
+                    "tasks/UPPER.YAML"):
+            self.assertTrue(grt._is_task_file_path(ok), ok)
+
+    def test_companion_files_rejected(self):
+        for not_task in ("tasks/.gitkeep", "tasks/README.md",
+                          "tasks/weird.json", "tasks/notes.txt",
+                          "tasks/", "README.md", "other/x.yaml"):
+            self.assertFalse(grt._is_task_file_path(not_task), not_task)
+
+
 class TestEmitBlobsSkipsUnsafeIds(unittest.TestCase):
     def test_unsafe_id_is_dropped_with_warning(self):
         class D(FakeDriver):
@@ -2252,15 +2267,17 @@ class TestProtocolCapabilities(unittest.TestCase):
         out = h.stdout.getvalue()
         self.assertIn("import\n", out)
         self.assertIn("export\n", out)
-        self.assertIn("refspec refs/heads/*:refs/remotes/fake/*\n", out)
-        self.assertIn("*push\n", out)
-        self.assertIn("*fetch\n", out)
+        self.assertIn(
+            "refspec refs/heads/*:refs/tasks/fake/heads/*\n", out
+        )
+        self.assertNotIn("*push\n", out)
+        self.assertNotIn("*fetch\n", out)
         self.assertTrue(out.endswith("\n\n"))
 
     def test_capabilities_flushes(self):
         h = make_handler(stdin_text="capabilities\n")
         h.run()
-        self.assertGreater(h.stdout.flush_count, 5)
+        self.assertGreater(h.stdout.flush_count, 3)
 
 
 class TestProtocolList(unittest.TestCase):
@@ -2292,6 +2309,18 @@ class TestProtocolImport(unittest.TestCase):
         self.assertEqual(out.count("blob\n"), 2)
         self.assertIn("deleteall\n", out)
         self.assertTrue(out.rstrip().endswith("done"))
+
+    def test_import_writes_to_private_namespace(self):
+        # Regression: helper must NOT write directly to refs/heads/main —
+        # that clobbers the user's own branch. Git's transport-helper
+        # redirects writes via the refspec capability into refs/tasks/<remote>/heads/*.
+        driver = FakeDriver(tasks=[self._task("fake-a")])
+        h = make_handler(driver=driver,
+                         stdin_text="import refs/heads/main\n\n")
+        h.run()
+        out = h.stdout.getvalue()
+        self.assertIn("commit refs/tasks/fake/heads/main\n", out)
+        self.assertNotIn("commit refs/heads/main\n", out)
 
     def test_blob_byte_length_correct(self):
         t = self._task("fake-a", title="üñîçödé")
@@ -2689,7 +2718,10 @@ class TestProtocolExport(unittest.TestCase):
         # The real entry point maps had_errors → exit 1.
         self.assertEqual(1 if h.had_errors else 0, 1)
 
-    def test_unknown_extension_in_export_logged(self):
+    def test_unknown_extension_in_export_silently_ignored(self):
+        # Non-task companions under tasks/ (e.g. tasks/.gitkeep,
+        # tasks/README.md, tasks/weird.json) must not fail the push —
+        # they are not task files, they just live in the same directory.
         driver = FakeDriver()
         stream = (
             "export\n"
@@ -2700,7 +2732,53 @@ class TestProtocolExport(unittest.TestCase):
         )
         h = make_handler(driver=driver, stdin_text=stream)
         h.run()
-        self.assertIn("unknown task file extension", h.stderr.getvalue())
+        self.assertEqual(driver.upserted, [])
+        self.assertNotIn("unknown task file extension", h.stderr.getvalue())
+        self.assertIn("ok refs/heads/main", h.stdout.getvalue())
+        self.assertFalse(h.had_errors)
+
+    def test_gitkeep_under_tasks_silently_ignored(self):
+        driver = FakeDriver()
+        stream = (
+            "export\n"
+            "commit refs/heads/main\n"
+            "blob\nmark :1\ndata 0\n\n"
+            "M 100644 :1 tasks/.gitkeep\n"
+            "\ndone\n"
+        )
+        h = make_handler(driver=driver, stdin_text=stream)
+        h.run()
+        self.assertEqual(driver.upserted, [])
+        self.assertIn("ok refs/heads/main", h.stdout.getvalue())
+        self.assertFalse(h.had_errors)
+
+    def test_readme_under_tasks_silently_ignored(self):
+        driver = FakeDriver()
+        stream = (
+            "export\n"
+            "commit refs/heads/main\n"
+            "blob\nmark :1\ndata 3\nhey\n"
+            "M 100644 :1 tasks/README.md\n"
+            "\ndone\n"
+        )
+        h = make_handler(driver=driver, stdin_text=stream)
+        h.run()
+        self.assertEqual(driver.upserted, [])
+        self.assertIn("ok refs/heads/main", h.stdout.getvalue())
+        self.assertFalse(h.had_errors)
+
+    def test_delete_of_gitkeep_silently_ignored(self):
+        driver = FakeDriver()
+        stream = (
+            "export\n"
+            "commit refs/heads/main\n"
+            "D tasks/.gitkeep\n"
+            "\ndone\n"
+        )
+        h = make_handler(driver=driver, stdin_text=stream)
+        h.run()
+        self.assertEqual(driver.deleted, [])
+        self.assertFalse(h.had_errors)
 
     def test_missing_blob_content_logged(self):
         driver = FakeDriver()
@@ -2720,6 +2798,49 @@ class TestProtocolExport(unittest.TestCase):
         h = make_handler(driver=driver, stdin_text=stream)
         h.run()
         self.assertIn("ok refs/heads/main\n", h.stdout.getvalue())
+
+    def test_binary_stdin_reads_blob_bytes_accurately(self):
+        # Regression: under real git, sys.stdin is a TextIOWrapper whose
+        # readline() buffers extra bytes in an internal decode buffer.
+        # Mixing that with sys.stdin.buffer.read(n) skips those buffered
+        # bytes and desyncs the export parser — symptom: mid-stream
+        # "invalid literal for int()" when the parser reads a URL value
+        # as a 'data N' header. _BinaryStdinReader must route everything
+        # through the binary layer.
+        task = full_task(id="jira-X")
+        body = grt.YAMLSerializer().serialize(task).encode("utf-8")
+        # Build a byte stream with multiple blobs so readline's internal
+        # buffer would definitely over-read if we went through TextIOWrapper.
+        stream = (
+            b"export\n"
+            b"blob\nmark :1\ndata " + str(len(body)).encode() + b"\n" + body + b"\n"
+            b"blob\nmark :2\ndata " + str(len(body)).encode() + b"\n" + body + b"\n"
+            b"commit refs/heads/main\n"
+            b"committer g <g@g> 0 +0000\ndata 1\nx\n"
+            b"M 100644 :1 tasks/jira-X.yaml\n"
+            b"M 100644 :2 tasks/jira-Y.yaml\n"
+            b"\ndone\n"
+        )
+        binary = io.BytesIO(stream)
+        reader = grt._BinaryStdinReader(binary)
+        driver = FakeDriver()
+        h = grt.ProtocolHandler("fake", "fake://x", driver,
+                                 grt.YAMLSerializer(),
+                                 stdin=reader,
+                                 stdout=FlushTrackingStringIO(),
+                                 stderr=io.StringIO())
+        h.run()
+        # Both modify directives land without a parser desync.
+        self.assertEqual(len(driver.upserted), 2)
+        self.assertFalse(h.had_errors)
+
+    def test_binary_stdin_reader_readline_decodes(self):
+        r = grt._BinaryStdinReader(
+            io.BytesIO("hello\nüñî\n".encode("utf-8"))
+        )
+        self.assertEqual(r.readline(), "hello\n")
+        self.assertEqual(r.readline(), "üñî\n")
+        self.assertEqual(r.readline(), "")
 
 
 class TestProtocolUnknown(unittest.TestCase):
