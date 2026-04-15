@@ -710,6 +710,17 @@ class Driver(ABC):
                    headers: dict | None = None) -> dict:
         return self._http_request("POST", url, headers=headers, body=body)
 
+    def _http_put(self, url: str, body: dict | None = None,
+                  headers: dict | None = None) -> dict:
+        return self._http_request("PUT", url, headers=headers, body=body)
+
+    def _http_patch(self, url: str, body: dict | None = None,
+                    headers: dict | None = None) -> dict:
+        return self._http_request("PATCH", url, headers=headers, body=body)
+
+    def _http_delete(self, url: str, headers: dict | None = None) -> dict:
+        return self._http_request("DELETE", url, headers=headers, body=None)
+
     def _http_request(self, method: str, url: str, headers: dict | None = None,
                       body: dict | None = None) -> dict:
         data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -764,6 +775,20 @@ class Driver(ABC):
         raise NotImplementedError(
             f"{self.__class__.__name__}.delete not connected to live API yet"
         )
+
+    # ---- Push-side shared helpers ----
+    def _native_id(self, task_id: str) -> str | None:
+        """Strip the `<scheme>-` prefix from a unified id; None if prefix missing.
+
+        Cross-source writes (e.g. editing `jira-X.yaml` in a Vikunja remote)
+        resolve to None here — callers refuse to push them and emit a
+        warning rather than silently creating a duplicate.
+        """
+        prefix = f"{self.SCHEME}-"
+        if task_id.startswith(prefix):
+            rest = task_id[len(prefix):]
+            return rest or None
+        return None
 
 
 # ---------- Jira ------------------------------------------------------------
@@ -916,6 +941,7 @@ class JiraDriver(Driver):
 # ---------- Vikunja ---------------------------------------------------------
 
 _VIKUNJA_PRIORITY_MAP = {1: "critical", 2: "high", 3: "medium", 4: "low", 5: "none"}
+_VIKUNJA_PRIORITY_MAP_INV = {v: k for k, v in _VIKUNJA_PRIORITY_MAP.items()}
 
 
 class VikunjaDriver(Driver):
@@ -992,6 +1018,68 @@ class VikunjaDriver(Driver):
                 break
             page += 1
         return tasks
+
+    # ---- Push ----
+    def _base_url(self) -> str:
+        base = self.config.get("baseUrl") or self.url
+        if not base:
+            raise VikunjaConfigError("Vikunja baseUrl is not configured")
+        return base.rstrip("/")
+
+    def _serialize_for_push(self, task: dict) -> dict:
+        payload: dict = {
+            "title": task.get("title") or "",
+            "description": task.get("description") or "",
+            "done": task.get("status") == "done",
+        }
+        pri = _VIKUNJA_PRIORITY_MAP_INV.get(task.get("priority") or "none")
+        if pri is not None:
+            payload["priority"] = pri
+        due = task.get("due_date")
+        if due:
+            payload["due_date"] = due if "T" in due else f"{due}T00:00:00Z"
+        return payload
+
+    def upsert(self, task: dict) -> None:
+        base = self._base_url()
+        headers = self._auth_header()
+        native = self._native_id(task.get("id") or "")
+        payload = self._serialize_for_push(task)
+        if native and native.isdigit():
+            self._http_post(f"{base}/api/v1/tasks/{native}",
+                             body=payload, headers=headers)
+            return
+        if native and not native.isdigit():
+            raise VikunjaPushError(
+                f"task id {task.get('id')!r} is not a numeric Vikunja id"
+            )
+        # Create path — needs a default project.
+        project_id = self.config.get("projectId")
+        if not project_id:
+            raise VikunjaPushError(
+                "projectId is required to create new Vikunja tasks; "
+                "set tasks-remote.<name>.projectId"
+            )
+        self._http_put(f"{base}/api/v1/projects/{project_id}/tasks",
+                        body=payload, headers=headers)
+
+    def delete(self, task_id: str) -> None:
+        base = self._base_url()
+        native = self._native_id(task_id)
+        if not native or not native.isdigit():
+            raise VikunjaPushError(
+                f"cannot delete {task_id!r}: not a Vikunja-sourced id"
+            )
+        self._http_delete(f"{base}/api/v1/tasks/{native}",
+                           headers=self._auth_header())
+
+
+class VikunjaConfigError(RuntimeError):
+    """Missing or invalid Vikunja driver configuration."""
+
+
+class VikunjaPushError(RuntimeError):
+    """Raised when a push is rejected before we even talk to Vikunja."""
 
 
 # ---------- MS Todo ---------------------------------------------------------

@@ -570,13 +570,58 @@ class TestVikunjaDriver(unittest.TestCase):
         with mock.patch.object(self.d, "_http_get", return_value={"tasks": []}):
             self.assertEqual(self.d.fetch_all(), [])
 
-    def test_upsert_not_implemented(self):
-        with self.assertRaises(NotImplementedError):
-            self.d.upsert({})
+    def test_upsert_updates_existing_vikunja_task(self):
+        calls = []
+        def fake_post(url, body=None, headers=None):
+            calls.append(("POST", url, body))
+            return {}
+        task = full_task(id="vikunja-42", source="vikunja", title="hello",
+                         status="done", priority="high",
+                         due_date="2025-05-01")
+        with mock.patch.object(self.d, "_http_post", side_effect=fake_post), \
+                mock.patch.object(self.d, "_http_put") as put:
+            self.d.upsert(task)
+        self.assertEqual(len(calls), 1)
+        _, url, body = calls[0]
+        self.assertTrue(url.endswith("/api/v1/tasks/42"))
+        self.assertEqual(body["title"], "hello")
+        self.assertTrue(body["done"])
+        # high → 2 with the existing map
+        self.assertEqual(body["priority"], 2)
+        self.assertEqual(body["due_date"], "2025-05-01T00:00:00Z")
+        put.assert_not_called()
 
-    def test_delete_not_implemented(self):
-        with self.assertRaises(NotImplementedError):
-            self.d.delete("vikunja-1")
+    def test_upsert_creates_on_project_when_no_native_id(self):
+        self.d.config["projectId"] = "99"
+        put_calls = []
+        def fake_put(url, body=None, headers=None):
+            put_calls.append(url)
+            return {"id": 123}
+        task = full_task(id="vikunja-", title="new")  # empty native id
+        with mock.patch.object(self.d, "_http_put", side_effect=fake_put):
+            self.d.upsert(task)
+        self.assertTrue(put_calls[0].endswith("/api/v1/projects/99/tasks"))
+
+    def test_upsert_refuses_cross_source(self):
+        task = full_task(id="jira-PROJ-1", source="jira")
+        with self.assertRaises(grt.VikunjaPushError):
+            self.d.upsert(task)
+
+    def test_upsert_requires_project_id_for_create(self):
+        self.d.config.pop("projectId", None)
+        task = full_task(id="", source="")
+        with self.assertRaises(grt.VikunjaPushError):
+            self.d.upsert(task)
+
+    def test_delete_calls_api(self):
+        with mock.patch.object(self.d, "_http_delete") as d:
+            self.d.delete("vikunja-42")
+            d.assert_called_once()
+            self.assertTrue(d.call_args[0][0].endswith("/api/v1/tasks/42"))
+
+    def test_delete_refuses_cross_source(self):
+        with self.assertRaises(grt.VikunjaPushError):
+            self.d.delete("jira-PROJ-1")
 
 
 # ---------------------------------------------------------------------------
