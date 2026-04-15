@@ -41,8 +41,12 @@ and this ordering is load-bearing for the test suite:
    task — regardless of source — is a dict with this exact shape.
 2. **Serializers** (`YAMLSerializer`, `OrgSerializer`). Both round-trip to
    the same unified dict. The YAML parser/emitter is **hand-written** — there
-   is no PyYAML dependency and none should be added. Only standard library is
-   used; `msal` is the sole optional extra (guarded by `MSAL_AVAILABLE`).
+   is no PyYAML dependency and none should be added. The shipped script uses
+   only the standard library; `msal` is the sole optional runtime extra
+   (guarded by `MSAL_AVAILABLE`). **Test-time dependencies are allowed** and
+   should be installed into `.venv` via a `requirements-dev.txt` — property
+   fuzzers (`hypothesis`), HTTP capture libraries, etc. They must not leak
+   into `git_remote_tasks.py`.
 3. **Git config reader** (`read_format`, `read_remote_config`). Thin wrapper
    over `git config --local`. All credentials live in `.git/config`, never
    the URL.
@@ -70,8 +74,11 @@ and this ordering is load-bearing for the test suite:
   an offset are normalized to UTC (`…Z`); plain dates (`2025-04-20`) do not
   gain a synthetic time. Any change to `_iso_to_org_timestamp` /
   `_org_timestamp_to_iso` must keep round-trip stability.
-- **Notion is pull-only.** `NotionDriver.upsert` / `delete` must raise
-  `NotImplementedError("Notion is pull-only")` — not silently no-op.
+- **All remotes are expected to round-trip.** Jira / Vikunja / MS Todo
+  drivers have stub writes (raise `NotImplementedError`) today;
+  Notion's "pull-only" label was self-imposed and is being lifted (see
+  PLAN.md FEAT-02 / FEAT-08). Stubs must fail loudly — never silently
+  return success — so `git push` reports the right exit code.
 - **Secret redaction in `check`.** Keys containing `token` or `password`
   (case-insensitive) are redacted in stdout. Adding a new credential-like
   key means extending this filter.

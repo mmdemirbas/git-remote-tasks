@@ -149,3 +149,62 @@ findings with three product decisions the user raised:
 Next action: tackle P0 correctness (BUG-01, BUG-04, BUG-05, BUG-07,
 SEC-01, SEC-02) and the runtime-honesty pair (BUG-02, FEAT-04) before
 the write paths (FEAT-01 → FEAT-02 → FEAT-03).
+
+## 2026-04-15 — P0 correctness sweep shipped
+
+Six fixes landed across six commits. Tests green (191 → now 193 after
+timezone round-trip additions).
+
+- `58e9311` BUG-01 Jira epic dict-shape category. Operator precedence
+  bug replaced with explicit if/elif; tests added for dict epics with
+  either `name` or `summary`.
+- `24cfca9` BUG-04 `_read_exactly` byte/char mismatch. Fallback now
+  counts UTF-8 bytes. Multi-byte blob round-trip test added.
+- `5b0a712` BUG-05 Linear fetch history. `git rev-parse --verify` the
+  previous remote tip; emit `from <sha>` when present so `git merge`
+  and `git bisect` behave. First fetch still omits `from`.
+- `f7a4a1c` BUG-07 Timezone offset preserved in org timestamps.
+  Agenda users see 12:30 +03:00 instead of 09:30 Z. Round-trip tests.
+- `438ed21` SEC-01 / SEC-02. Widened `cmd_check` redaction with an
+  allow-list; hardened `cmd_uninstall` to only unlink symlinks that
+  actually target our script.
+
+## 2026-04-15 — Redirected by user on three new fronts
+
+Mid-execution the user raised three requirements that reshaped the
+plan:
+
+1. **Incremental fetch.** External services are not git remotes; they
+   have no native object graph. Pulling the full task set every
+   `git fetch` is infeasible at real scale. Researched each service:
+   - Jira: JQL `updated >= "<iso>" ORDER BY updated ASC`.
+   - Vikunja: `filter=updated > '<iso>'&sort_by=updated`.
+   - MS Todo: Graph delta query with persisted `@odata.deltaLink` —
+     the only one with native deletion tombstones.
+   - Notion: `filter.last_edited_time.after = <iso>`; archived pages
+     come back with `archived: true`.
+   Captured as **FEAT-06** (sync-state per remote in `.git/config`)
+   and **FEAT-07** (emit per-file `M` / `D` on incremental runs
+   instead of `deleteall`).
+2. **Notion push.** The "pull-only" label was self-imposed. Notion
+   supports `POST /v1/pages`, `PATCH /v1/pages/{id}`, and
+   `PATCH archived: true`. Captured as **FEAT-08**; the invariant is
+   removed from `CLAUDE.md`.
+3. **YAML parser safety.** The single-file, stdlib-only constraint
+   means we own the parser. Test-time dependencies are OK (confirmed
+   explicitly); `hypothesis` fuzz tests plus an adversarial corpus go
+   into **TEST-04**, with a documented supported-subset list so the
+   bug surface is bounded.
+
+PLAN.md and CLAUDE.md updated to match. Execution order revised:
+runtime honesty (BUG-02, FEAT-04) → parser audit (TEST-04) →
+tasks-init ergonomics → incremental fetch (FEAT-06 → FEAT-07) → write
+paths (FEAT-01 → FEAT-02 → FEAT-08 → FEAT-03) → org agenda (FEAT-05).
+
+### SPEC.md retirement
+
+SPEC.md was the original delivery specification. Now that the
+implementation is in git history and PLAN.md tracks forward work,
+SPEC.md is redundant. Git preserves it at commit `8600dde` if we ever
+need to look back. Removed in the same commit batch as the plan
+update.
