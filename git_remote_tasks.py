@@ -739,12 +739,16 @@ class JiraDriver(Driver):
         epic = fields.get("customfield_10014") or fields.get("epic")
         project = fields.get("project") or {}
         if epic:
-            t["category"] = {
-                "id": epic if isinstance(epic, str) else (epic or {}).get("key"),
-                "name": (epic.get("name") if isinstance(epic, dict) else None) or epic
-                         if isinstance(epic, str) else None,
-                "type": "epic",
-            }
+            if isinstance(epic, dict):
+                epic_id = epic.get("key") or epic.get("id")
+                epic_name = epic.get("name") or epic.get("summary")
+            elif isinstance(epic, str):
+                epic_id = epic
+                epic_name = epic
+            else:
+                epic_id = None
+                epic_name = None
+            t["category"] = {"id": epic_id, "name": epic_name, "type": "epic"}
         else:
             t["category"] = {
                 "id": project.get("key"),

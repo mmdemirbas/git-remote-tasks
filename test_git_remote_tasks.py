@@ -452,6 +452,21 @@ class TestJiraDriver(unittest.TestCase):
     def test_epic_category(self):
         t = self.d.normalize(self._issue(customfield_10014="EPIC-1"))
         self.assertEqual(t["category"]["type"], "epic")
+        self.assertEqual(t["category"]["id"], "EPIC-1")
+        self.assertEqual(t["category"]["name"], "EPIC-1")
+
+    def test_epic_category_dict_shape(self):
+        epic = {"key": "EPIC-7", "name": "Platform Reliability"}
+        t = self.d.normalize(self._issue(customfield_10014=epic))
+        self.assertEqual(t["category"]["type"], "epic")
+        self.assertEqual(t["category"]["id"], "EPIC-7")
+        self.assertEqual(t["category"]["name"], "Platform Reliability")
+
+    def test_epic_category_dict_with_only_summary(self):
+        epic = {"id": "10042", "summary": "Auth overhaul"}
+        t = self.d.normalize(self._issue(customfield_10014=epic))
+        self.assertEqual(t["category"]["id"], "10042")
+        self.assertEqual(t["category"]["name"], "Auth overhaul")
 
     def test_project_category(self):
         t = self.d.normalize(self._issue())
