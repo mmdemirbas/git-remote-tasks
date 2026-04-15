@@ -1,26 +1,36 @@
 #!/usr/bin/env bash
 # tasks-init — initialize a git repo for task sync with git-remote-tasks.
 #
-# Usage:
-#   tasks-init [--format yaml|org] [--dir PATH]
-#   tasks-init --help
-#
-# What it does:
-#   1. Creates the target directory (or uses cwd) and runs `git init`.
-#   2. Prompts for the file format if --format was not given (yaml or org).
-#   3. Writes `[tasks] format = <choice>` via `git config --local`.
-#   4. Creates a minimal .gitignore.
-#   5. Creates tasks/ with a .gitkeep.
-#   6. Makes an empty initial commit "tasks: init (<format> format)".
-#   7. Prints next steps (how to add a remote, how to fetch).
+# Matches `git init [path]` semantics: operates in the current directory
+# by default, or creates and enters <path> when given.
 
 set -euo pipefail
 
 FORMAT=""
-DIR=""
+TARGET=""
 
 usage() {
-  sed -n '1,16p' "$0" | sed 's/^# \{0,1\}//'
+  cat <<'USAGE'
+tasks-init — initialize a git repo for task sync with git-remote-tasks.
+
+Usage:
+  tasks-init [--format yaml|org] [path]
+  tasks-init --help
+
+Behaviour:
+  - If <path> is given, create it (if missing) and cd into it, then run
+    `git init`. Mirrors `git init [path]`.
+  - If --format is not given, prompt interactively for yaml or org.
+  - Writes `[tasks] format = <choice>` into .git/config.
+  - Creates tasks/ with a .gitkeep and a minimal .gitignore.
+  - Makes an initial commit "tasks: init (<format> format)".
+  - Prints next steps for adding a remote.
+
+After the fetch path in FEAT-05 lands, `git merge <remote>/main` no
+longer needs `--allow-unrelated-histories` for incremental fetches.
+The first fetch still creates a root commit on the remote-tracking
+ref, so the initial merge in step 3 below keeps the flag.
+USAGE
 }
 
 while [[ $# -gt 0 ]]; do
@@ -30,23 +40,37 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --dir)
-      DIR="${2:-}"
+      # Deprecated alias for the positional form; still honored so
+      # previously-pasted READMEs keep working. Prefer the positional.
+      TARGET="${2:-}"
       shift 2
       ;;
     -h|--help)
       usage
       exit 0
       ;;
-    *)
-      echo "tasks-init: unknown argument: $1" >&2
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "tasks-init: unknown option: $1" >&2
       exit 2
+      ;;
+    *)
+      if [[ -n "$TARGET" ]]; then
+        echo "tasks-init: too many positional arguments" >&2
+        exit 2
+      fi
+      TARGET="$1"
+      shift
       ;;
   esac
 done
 
-if [[ -n "$DIR" ]]; then
-  mkdir -p "$DIR"
-  cd "$DIR"
+if [[ -n "$TARGET" ]]; then
+  mkdir -p "$TARGET"
+  cd "$TARGET"
 fi
 
 if [[ -z "$FORMAT" ]]; then
@@ -102,7 +126,7 @@ Next steps:
        git config tasks-remote.vikunja.baseUrl   http://localhost:3456
        git config tasks-remote.vikunja.apiToken  YOUR_TOKEN
 
-  3. Pull tasks:
+  3. Pull tasks (first fetch only needs --allow-unrelated-histories):
        git fetch vikunja
        git merge vikunja/main --allow-unrelated-histories
        ls tasks/
