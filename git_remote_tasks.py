@@ -37,6 +37,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -958,14 +959,25 @@ class Driver(ABC):
         attempt = 0
         backoff = 0.5
         last_exc: Exception | None = None
+        debug = bool(os.environ.get("GIT_REMOTE_TASKS_DEBUG"))
         while attempt <= self.HTTP_MAX_RETRIES:
             attempt += 1
             req = urllib.request.Request(url, data=data, method=method)
             for k, v in merged_headers.items():
                 req.add_header(k, v)
+            t0 = time.time() if debug else 0.0
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     raw = resp.read().decode("utf-8")
+                if debug:
+                    # Scrub query string so tokens embedded in URLs (rare)
+                    # don't leak into operator logs; keep path + host.
+                    safe = url.split("?", 1)[0]
+                    sys.stderr.write(
+                        f"git-remote-tasks: http[{method}] "
+                        f"{time.time() - t0:.2f}s {safe}\n"
+                    )
+                    sys.stderr.flush()
                 return json.loads(raw) if raw else {}
             except urllib.error.HTTPError as exc:
                 if exc.code in self.HTTP_RETRY_STATUSES \
@@ -1806,10 +1818,27 @@ class MSTodoDriver(Driver):
               f"Visit {flow.get('verification_uri')} and enter {flow['user_code']}",
               file=sys.stderr, flush=True)
         # E2-03: cap the device-code wait so `git fetch` never hangs
-        # indefinitely when the user walks away. Respect the upstream
-        # `expires_in` when present; otherwise fall back to 10 minutes.
-        expires_in = int(flow.get("expires_in") or 600)
-        flow["expires_at"] = expires_in  # msal honors this if supported.
+        # indefinitely when the user walks away. `flow["expires_at"]` is an
+        # ABSOLUTE epoch timestamp (seconds since 1970) — MSAL stops
+        # polling once `time.time() > expires_at`. The previous version
+        # assigned `expires_in` (a small duration) here, which evaluated
+        # to "expired in January 1970" and made MSAL bail on its first
+        # poll with an 'authorization_pending' error even when the user
+        # had already approved. `initiate_device_flow` already sets
+        # `expires_at` to a correct absolute deadline (now + upstream
+        # `expires_in`, typically 900s); we only clamp below that when a
+        # shorter per-remote ceiling is configured.
+        cap_raw = self.config.get("deviceFlowTimeout")
+        if cap_raw:
+            try:
+                cap = float(cap_raw)
+            except (TypeError, ValueError):
+                cap = 0.0
+            if cap > 0:
+                flow["expires_at"] = min(
+                    float(flow.get("expires_at") or (time.time() + cap)),
+                    time.time() + cap,
+                )
         result = app.acquire_token_by_device_flow(flow)
         if "access_token" not in result:
             raise NotImplementedError(
@@ -2589,7 +2618,25 @@ class ProtocolHandler:
         if not changed and not deleted_ids:
             # P2-02: nothing new — skip the empty commit entirely so
             # `git log <remote>/main` stays clean of no-op rows.
-            self._record_pending_since(new_since or since, parent)
+            #
+            # CRITICAL: even with no commits, we MUST terminate the
+            # fast-import stream with `done\n`. `git fetch` spawned
+            # `git fast-import` to consume our stdout when it sent
+            # `import <ref>`, and fast-import only exits when it sees
+            # `done` or EOF. Returning silently here makes fast-import
+            # block forever, which makes git keep our stdin open, which
+            # makes our run() loop block on readline → multi-minute hang
+            # that looks indistinguishable from "fetch is slow".
+            self._write("done\n")
+            # The two-phase watermark is pointless when no stream was
+            # emitted — there is nothing that could fail between our
+            # exit and git's. Promote `new_since` directly, otherwise a
+            # quiet period keeps re-querying the same widening window on
+            # every fetch (the tip never moves, so pending never
+            # promotes). Also clears any stale pending entry.
+            promote = new_since or since
+            if promote:
+                self._commit_pending_since(promote)
             return
         changed_sorted = sorted(changed, key=lambda t: t.get("id") or "")
         self._write_incremental_import(changed_sorted, deleted_ids,

@@ -842,6 +842,68 @@ class TestCoverageGaps(unittest.TestCase):
             with self.assertRaises(NotImplementedError):
                 d._acquire_token()
 
+    def test_msal_device_flow_preserves_absolute_expires_at(self):
+        # Regression: `flow["expires_at"]` is an ABSOLUTE epoch timestamp.
+        # The old code overwrote it with the small integer `expires_in`
+        # (a duration), which MSAL interpreted as "expired in 1970" and
+        # bailed on the first poll with 'authorization_pending' — even
+        # when the user had already entered the code. We must leave the
+        # absolute deadline that `initiate_device_flow` set in place.
+        import time as _time
+        d = grt.MSTodoDriver("m", "mstodo://x", {"clientId": "c"})
+        absolute_deadline = _time.time() + 900
+        captured = {}
+        fake_app = mock.Mock()
+        fake_app.initiate_device_flow.return_value = {
+            "user_code": "X",
+            "verification_uri": "http://example",
+            "message": "go",
+            "expires_in": 900,
+            "expires_at": absolute_deadline,
+        }
+        def capture_flow(flow):
+            captured["expires_at"] = flow["expires_at"]
+            return {"access_token": "tok"}
+        fake_app.acquire_token_by_device_flow.side_effect = capture_flow
+        fake_msal = mock.Mock()
+        fake_msal.PublicClientApplication.return_value = fake_app
+        with mock.patch.object(grt, "MSAL_AVAILABLE", True), \
+                mock.patch.object(grt, "msal", fake_msal, create=True), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            token = d._acquire_token()
+        self.assertEqual(token, "tok")
+        # Must still be an absolute deadline at least "now-ish". The bug
+        # would have reduced it to 900 (epoch 1970-01-01 00:15:00).
+        self.assertGreater(captured["expires_at"], _time.time() - 5)
+
+    def test_msal_device_flow_respects_deviceFlowTimeout_cap(self):
+        # A shorter per-remote cap clamps the absolute deadline below
+        # what the upstream returned. `deviceFlowTimeout=60` means
+        # expires_at ends up within ~60s of now.
+        import time as _time
+        d = grt.MSTodoDriver("m", "mstodo://x",
+                              {"clientId": "c", "deviceFlowTimeout": "60"})
+        captured = {}
+        fake_app = mock.Mock()
+        fake_app.initiate_device_flow.return_value = {
+            "user_code": "X", "verification_uri": "u", "message": "go",
+            "expires_in": 900, "expires_at": _time.time() + 900,
+        }
+        def capture_flow(flow):
+            captured["expires_at"] = flow["expires_at"]
+            return {"access_token": "tok"}
+        fake_app.acquire_token_by_device_flow.side_effect = capture_flow
+        fake_msal = mock.Mock()
+        fake_msal.PublicClientApplication.return_value = fake_app
+        now = _time.time()
+        with mock.patch.object(grt, "MSAL_AVAILABLE", True), \
+                mock.patch.object(grt, "msal", fake_msal, create=True), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            d._acquire_token()
+        # Clamped to roughly now + 60.
+        self.assertLess(captured["expires_at"], now + 90)
+        self.assertGreater(captured["expires_at"], now + 30)
+
     def test_msal_device_flow_acquire_returns_no_token(self):
         d = grt.MSTodoDriver("m", "mstodo://x", {"clientId": "c"})
         fake_app = mock.Mock()
@@ -1288,6 +1350,69 @@ class TestEmptyDeltaNoCommit(unittest.TestCase):
         out = h.stdout.getvalue()
         self.assertNotIn("commit refs/heads/main", out,
                           "empty delta must not produce a commit")
+
+    def test_empty_delta_still_terminates_fast_import_stream(self):
+        # Regression: when there are no changes and no deletes, the
+        # helper must still write `done\n` so the `git fast-import`
+        # subprocess git spawned for our `import <ref>` knows to exit.
+        # Without it, fast-import waits forever for more input → git
+        # keeps the helper's stdin open → the helper's run() loop
+        # blocks on readline → the entire `git fetch` hangs for
+        # several minutes before something kills it. This used to
+        # surface as "Jira fetch is super slow" even though only one
+        # 0.5s API call was made.
+        driver = IncrementalFakeDriver(changed=[], deleted=[])
+        driver.config = {
+            "sync.mode": "incremental",
+            "sync.lastFetchAt": "2026-04-15T00:00:00Z",
+        }
+        def fake_run(cmd, *args, **kwargs):
+            if "rev-parse" in cmd:
+                return mock.Mock(returncode=0, stdout="a" * 40 + "\n",
+                                  stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        h = make_handler(driver=driver,
+                         stdin_text="import refs/heads/main\n\n")
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            h.run()
+        out = h.stdout.getvalue()
+        self.assertEqual(out.strip().splitlines()[-1], "done",
+                          "empty-delta import must terminate the "
+                          "fast-import stream with `done`")
+
+    def test_no_changes_still_advances_lastFetchAt(self):
+        # Regression: when fetch_changed returns no changes, the tip
+        # cannot move, so the two-phase watermark would never promote.
+        # Each subsequent fetch would re-query a widening window (and on
+        # services like Jira with heavy histories, gets progressively
+        # slower). We now promote `lastFetchAt` directly in the
+        # zero-changes case — safe because no fast-import stream was
+        # emitted, so nothing can fail between our exit and git's.
+        driver = IncrementalFakeDriver(changed=[], deleted=[],
+                                        new_since="2026-04-15T12:00:00Z")
+        driver.config = {
+            "sync.mode": "incremental",
+            "sync.lastFetchAt": "2026-04-15T00:00:00Z",
+        }
+        captured: dict[str, str] = {}
+        def fake_run(cmd, *args, **kwargs):
+            if "rev-parse" in cmd:
+                return mock.Mock(returncode=0, stdout="a" * 40 + "\n",
+                                  stderr="")
+            if len(cmd) >= 5 and cmd[:3] == ["git", "config", "--local"]:
+                captured[cmd[3]] = cmd[4]
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        h = make_handler(driver=driver,
+                         stdin_text="import refs/heads/main\n\n")
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            h.run()
+        self.assertEqual(
+            captured.get("tasks-remote.fake.sync.lastFetchAt"),
+            "2026-04-15T12:00:00Z",
+            "empty-delta fetch must still advance lastFetchAt so the "
+            "next incremental query window does not keep widening.",
+        )
 
 
 class TestResetSubcommand(unittest.TestCase):
