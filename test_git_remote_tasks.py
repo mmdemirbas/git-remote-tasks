@@ -940,6 +940,26 @@ class TestProtocolImport(unittest.TestCase):
         h.run()
         self.assertIn("deleteall", h.stdout.getvalue())
 
+    def test_no_from_on_first_fetch(self):
+        driver = FakeDriver(tasks=[self._task("fake-a")])
+        with mock.patch.object(subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=1, stdout="", stderr="")
+            h = make_handler(driver=driver,
+                             stdin_text="import refs/heads/main\n\n")
+            h.run()
+        self.assertNotIn("\nfrom ", h.stdout.getvalue())
+
+    def test_from_emitted_when_remote_tip_exists(self):
+        driver = FakeDriver(tasks=[self._task("fake-a")])
+        sha = "a" * 40
+        with mock.patch.object(subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout=sha + "\n",
+                                          stderr="")
+            h = make_handler(driver=driver,
+                             stdin_text="import refs/heads/main\n\n")
+            h.run()
+        self.assertIn(f"from {sha}\n", h.stdout.getvalue())
+
 
 class TestProtocolExport(unittest.TestCase):
     def _export_stream_modify(self, task: dict, ext="yaml") -> str:

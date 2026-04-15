@@ -1128,11 +1128,32 @@ class ProtocolHandler:
         self._write(f"committer git-remote-tasks <tasks@local> {ts} +0000\n")
         self._write(f"data {len(mbytes)}\n")
         self._write(message + "\n")
+        parent = self._previous_tip()
+        if parent:
+            self._write(f"from {parent}\n")
         self._write("deleteall\n")
         for mark, _body, path in blobs:
             self._write(f"M 100644 :{mark} {path}\n")
         self._write("\n")
         self._write("done\n")
+
+    def _previous_tip(self) -> str | None:
+        """Return the sha of refs/remotes/<remote>/main if it exists, else None.
+
+        Producing `from <sha>` keeps successive imports as a linear history so
+        that `git merge <remote>/main` and `git bisect` work without
+        --allow-unrelated-histories.
+        """
+        try:
+            proc = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet",
+                 f"refs/remotes/{self.remote_name}/main"],
+                capture_output=True, text=True, check=False,
+            )
+        except (FileNotFoundError, OSError):
+            return None
+        sha = proc.stdout.strip()
+        return sha or None
 
     @staticmethod
     def _latest_updated(tasks: list[dict]) -> datetime:
