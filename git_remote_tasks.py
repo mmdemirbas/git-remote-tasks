@@ -776,6 +776,50 @@ class Driver(ABC):
             f"{self.__class__.__name__}.delete not connected to live API yet"
         )
 
+    # ---- Mapping helpers (FEAT-03) ----
+    def _subconfig(self, prefix: str) -> dict:
+        """Return flat sub-keys of `self.config` that start with `<prefix>.`.
+
+        Example: `_subconfig("statusMap")` on a config with
+        `statusMap.Triage=todo` returns `{"Triage": "todo"}`. Values
+        preserve their original casing; the caller applies case policy.
+        """
+        pref = f"{prefix}."
+        return {k[len(pref):]: v for k, v in self.config.items()
+                if k.startswith(pref)}
+
+    def _apply_status_override(self, upstream_value: str | None,
+                                default: str) -> str:
+        """Return the unified status for an upstream status string.
+
+        Lookup order: exact match in the user-configured `statusMap`,
+        then case-insensitive match, then the default the caller passed
+        (driver's built-in map result). Unknown upstream values that the
+        default could not translate produce a one-time warning via the
+        driver's `_note_unmapped` sink so data loss is never silent.
+        """
+        if upstream_value is None:
+            return default
+        m = self._subconfig("statusMap")
+        if upstream_value in m:
+            return m[upstream_value]
+        lower = {k.lower(): v for k, v in m.items()}
+        return lower.get(upstream_value.strip().lower(), default)
+
+    def _apply_priority_override(self, upstream_value: str | None,
+                                  default: str) -> str:
+        if upstream_value is None:
+            return default
+        m = self._subconfig("priorityMap")
+        if upstream_value in m:
+            return m[upstream_value]
+        lower = {k.lower(): v for k, v in m.items()}
+        return lower.get(upstream_value.strip().lower(), default)
+
+    def _field_name(self, logical: str, default: str) -> str:
+        """Resolve a service-side field name via `fieldMap.<logical>`."""
+        return self.config.get(f"fieldMap.{logical}", default)
+
     # ---- Push-side shared helpers ----
     def _native_id(self, task_id: str) -> str | None:
         """Strip the `<scheme>-` prefix from a unified id; None if prefix missing.
@@ -857,11 +901,13 @@ class JiraDriver(Driver):
         t["title"] = fields.get("summary") or ""
         desc = fields.get("description")
         t["description"] = _jira_extract_adf_text(desc) if isinstance(desc, dict) else desc
-        status_name = ((fields.get("status") or {}).get("name") or "").strip().lower()
-        t["status"] = _JIRA_STATUS_MAP.get(status_name, "todo")
+        status_name_raw = ((fields.get("status") or {}).get("name") or "").strip()
+        built_in = _JIRA_STATUS_MAP.get(status_name_raw.lower(), "todo")
+        t["status"] = self._apply_status_override(status_name_raw, built_in)
         pri = (fields.get("priority") or {}).get("name") if fields.get("priority") else None
         if pri:
-            t["priority"] = _JIRA_PRIORITY_MAP.get(pri.strip().lower(), "medium")
+            built_in_pri = _JIRA_PRIORITY_MAP.get(pri.strip().lower(), "medium")
+            t["priority"] = self._apply_priority_override(pri, built_in_pri)
         else:
             t["priority"] = "none"
         t["created_date"] = fields.get("created")
@@ -1082,9 +1128,17 @@ class VikunjaDriver(Driver):
         t["source"] = "vikunja"
         t["title"] = task.get("title") or ""
         t["description"] = task.get("description") or None
-        t["status"] = "done" if task.get("done") else "todo"
+        # Vikunja's `done` boolean is our status. The statusMap override
+        # still applies to 'done' / 'todo' literals in case the user wants
+        # a different unified value.
+        default_status = "done" if task.get("done") else "todo"
+        t["status"] = self._apply_status_override(default_status, default_status)
         pri = task.get("priority")
-        t["priority"] = _VIKUNJA_PRIORITY_MAP.get(pri, "none") if pri is not None else "none"
+        if pri is not None:
+            built_in_pri = _VIKUNJA_PRIORITY_MAP.get(pri, "none")
+            t["priority"] = self._apply_priority_override(str(pri), built_in_pri)
+        else:
+            t["priority"] = "none"
         t["created_date"] = task.get("created")
         t["updated_date"] = task.get("updated")
         t["due_date"] = task.get("due_date") or task.get("end_date") or task.get("start_date")
@@ -1294,8 +1348,12 @@ class MSTodoDriver(Driver):
         t["title"] = task.get("title") or ""
         body = task.get("body") or {}
         t["description"] = body.get("content") if isinstance(body, dict) else None
-        t["status"] = _MSTODO_STATUS_MAP.get(task.get("status", ""), "todo")
-        t["priority"] = _MSTODO_PRIORITY_MAP.get(task.get("importance", ""), "none")
+        status_raw = task.get("status", "")
+        built_in_status = _MSTODO_STATUS_MAP.get(status_raw, "todo")
+        t["status"] = self._apply_status_override(status_raw, built_in_status)
+        importance_raw = task.get("importance", "")
+        built_in_pri = _MSTODO_PRIORITY_MAP.get(importance_raw, "none")
+        t["priority"] = self._apply_priority_override(importance_raw, built_in_pri)
         t["created_date"] = task.get("createdDateTime")
         t["updated_date"] = task.get("lastModifiedDateTime")
         due = task.get("dueDateTime")
@@ -1439,6 +1497,23 @@ class NotionDriver(Driver):
             return ""
         return "".join((item.get("plain_text") or "") for item in rt_list if isinstance(item, dict))
 
+    def _prop_names(self) -> dict:
+        """Return the service-side property names for each logical field.
+
+        Each value can be overridden via `fieldMap.<logical>` in the remote
+        config — e.g. `fieldMap.status = Column Status`. Matching against
+        the Notion payload is still case-insensitive so minor casing
+        differences don't break pulls.
+        """
+        return {
+            "status":      self._field_name("status", "Status"),
+            "priority":    self._field_name("priority", "Priority"),
+            "tags":        self._field_name("tags", "Tags"),
+            "due_date":    self._field_name("due_date", "Due"),
+            "description": self._field_name("description", "Description"),
+            "done":        self._field_name("done", "Done"),
+        }
+
     def normalize(self, page: dict, db_title: str | None = None) -> dict:
         t = empty_task()
         pid = page.get("id") or ""
@@ -1452,7 +1527,7 @@ class NotionDriver(Driver):
                 break
         if title_prop:
             t["title"] = self._text_from_rich(title_prop.get("title") or [])
-        # Status / priority via select; tags via multi_select; dates via date.
+        wanted = {k: v.lower() for k, v in self._prop_names().items()}
         for name, p in props.items():
             if not isinstance(p, dict):
                 continue
@@ -1461,19 +1536,20 @@ class NotionDriver(Driver):
             if ptype == "select":
                 val = p.get("select") or {}
                 name_val = val.get("name") if val else None
-                if lname in ("status", "state") and name_val:
-                    mapped = _JIRA_STATUS_MAP.get(name_val.lower())
-                    t["status"] = mapped or "todo"
-                elif lname == "priority" and name_val:
-                    t["priority"] = _JIRA_PRIORITY_MAP.get(name_val.lower(), "none")
-            elif ptype == "multi_select" and lname in ("tags", "labels"):
+                if lname == wanted["status"] and name_val:
+                    mapped = _JIRA_STATUS_MAP.get(name_val.lower()) or "todo"
+                    t["status"] = self._apply_status_override(name_val, mapped)
+                elif lname == wanted["priority"] and name_val:
+                    mapped_pri = _JIRA_PRIORITY_MAP.get(name_val.lower(), "none")
+                    t["priority"] = self._apply_priority_override(name_val, mapped_pri)
+            elif ptype == "multi_select" and lname == wanted["tags"]:
                 t["tags"] = [m.get("name", "") for m in (p.get("multi_select") or [])]
-            elif ptype == "date" and lname in ("due", "due date", "duedate", "deadline"):
+            elif ptype == "date" and lname == wanted["due_date"]:
                 d = p.get("date") or {}
                 t["due_date"] = d.get("start")
-            elif ptype == "checkbox" and lname in ("done", "completed"):
+            elif ptype == "checkbox" and lname == wanted["done"]:
                 t["status"] = "done" if p.get("checkbox") else t["status"]
-            elif ptype == "rich_text" and lname in ("description", "notes"):
+            elif ptype == "rich_text" and lname == wanted["description"]:
                 t["description"] = self._text_from_rich(p.get("rich_text") or []) or None
         t["created_date"] = page.get("created_time")
         t["updated_date"] = page.get("last_edited_time")
@@ -1542,7 +1618,13 @@ class NotionDriver(Driver):
         )
 
     def _build_properties(self, task: dict, title_prop: str) -> dict:
-        """Render a unified task into Notion's properties shape."""
+        """Render a unified task into Notion's properties shape.
+
+        Service-side column names come from `_prop_names()` so push and
+        pull use the same `fieldMap.*` overrides — no risk of writing to
+        "Status" while reading from "State".
+        """
+        names = self._prop_names()
         props: dict = {
             title_prop: {
                 "title": [{"type": "text",
@@ -1551,19 +1633,19 @@ class NotionDriver(Driver):
         }
         status = self._STATUS_TO_NOTION.get(task.get("status") or "todo")
         if status:
-            props["Status"] = {"select": {"name": status}}
+            props[names["status"]] = {"select": {"name": status}}
         pri = self._PRIORITY_TO_NOTION.get(task.get("priority") or "none")
         if pri:
-            props["Priority"] = {"select": {"name": pri}}
+            props[names["priority"]] = {"select": {"name": pri}}
         if task.get("tags"):
-            props["Tags"] = {
+            props[names["tags"]] = {
                 "multi_select": [{"name": t} for t in task["tags"]]
             }
         if task.get("due_date"):
-            props["Due"] = {"date": {"start": task["due_date"]}}
+            props[names["due_date"]] = {"date": {"start": task["due_date"]}}
         desc = task.get("description")
         if desc:
-            props["Description"] = {
+            props[names["description"]] = {
                 "rich_text": [{"type": "text",
                                 "text": {"content": desc}}]
             }

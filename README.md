@@ -162,6 +162,28 @@ the next run can ask the service only for what changed:
 - **MS Todo** and **Notion** currently fall back to a full fetch on
   every run; per-service incremental APIs land with their write paths.
 
+### 7.2 Custom status / priority / field mapping
+
+Every non-trivial tracker lets the team rename workflows and columns.
+Map them back to the unified vocabulary through per-remote config:
+
+| Key pattern                                        | Applies to        | Example                                           |
+|----------------------------------------------------|-------------------|---------------------------------------------------|
+| `tasks-remote.<name>.statusMap.<upstream>`         | all writable      | `statusMap.Triage = in_progress`                  |
+| `tasks-remote.<name>.priorityMap.<upstream>`       | all writable      | `priorityMap.P0 = critical`                       |
+| `tasks-remote.<name>.fieldMap.status`              | Notion            | `fieldMap.status = Workflow`                      |
+| `tasks-remote.<name>.fieldMap.priority`            | Notion            | `fieldMap.priority = Urgency`                     |
+| `tasks-remote.<name>.fieldMap.tags`                | Notion            | `fieldMap.tags = Labels`                          |
+| `tasks-remote.<name>.fieldMap.description`         | Notion            | `fieldMap.description = Notes`                    |
+| `tasks-remote.<name>.fieldMap.due_date`            | Notion            | `fieldMap.due_date = Deadline`                    |
+
+Overrides apply to *both* directions — the same column name is read
+on pull and written on push, so renaming a field once in git config is
+enough. Status / priority lookups are case-insensitive after checking
+for an exact match, so `statusMap.Triage` wins over the default for
+`"triage"` too. Upstream values the map does not cover fall back to
+the driver's built-in defaults (e.g. `_JIRA_STATUS_MAP`).
+
 Neither Jira nor Vikunja exposes a native deletion feed, so tasks
 removed upstream are only garbage-collected on a full fetch. Set
 `sync.mode=full` periodically (or before releases) to reconcile:

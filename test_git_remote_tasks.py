@@ -367,6 +367,89 @@ class TestConfigReader(unittest.TestCase):
 # Driver normalization - Jira
 # ---------------------------------------------------------------------------
 
+class TestMappingOverrides(unittest.TestCase):
+    """FEAT-03: statusMap / priorityMap / fieldMap applied to normalize()."""
+
+    def test_jira_status_map_override(self):
+        d = grt.JiraDriver("jira", "https://x", {
+            "baseUrl": "https://x", "email": "a", "apiToken": "t",
+            "statusMap.Triage": "in_progress",
+            "statusMap.Backlog": "todo",
+        })
+        issue = {"key": "K-1", "fields": {
+            "summary": "t",
+            "status": {"name": "Triage"},
+            "priority": {"name": "High"},
+            "project": {"key": "P", "name": "P"},
+        }}
+        self.assertEqual(d.normalize(issue)["status"], "in_progress")
+
+    def test_jira_priority_map_override(self):
+        d = grt.JiraDriver("jira", "https://x", {
+            "baseUrl": "https://x", "email": "a", "apiToken": "t",
+            "priorityMap.P0": "critical",
+        })
+        issue = {"key": "K-1", "fields": {
+            "summary": "t",
+            "status": {"name": "To Do"},
+            "priority": {"name": "P0"},
+            "project": {"key": "P", "name": "P"},
+        }}
+        self.assertEqual(d.normalize(issue)["priority"], "critical")
+
+    def test_notion_field_map_changes_column_names(self):
+        d = grt.NotionDriver("notion", "notion://x", {
+            "databaseId": "abc", "token": "t",
+            "fieldMap.status": "Workflow",
+            "fieldMap.priority": "Urgency",
+            "fieldMap.tags": "Labels",
+            "fieldMap.description": "Notes",
+            "fieldMap.due_date": "Target",
+        })
+        page = {
+            "id": "p",
+            "properties": {
+                "Name": {"type": "title",
+                         "title": [{"plain_text": "t"}]},
+                "Workflow": {"type": "select",
+                              "select": {"name": "In Progress"}},
+                "Urgency": {"type": "select",
+                             "select": {"name": "Critical"}},
+                "Labels": {"type": "multi_select",
+                             "multi_select": [{"name": "a"}]},
+                "Notes": {"type": "rich_text",
+                           "rich_text": [{"plain_text": "n"}]},
+                "Target": {"type": "date",
+                            "date": {"start": "2025-01-01"}},
+                # 'Status' column must NOT be read when mapped away.
+                "Status": {"type": "select",
+                             "select": {"name": "Done"}},
+            },
+        }
+        t = d.normalize(page)
+        self.assertEqual(t["status"], "in_progress",
+                          "fieldMap.status must redirect reads")
+        self.assertEqual(t["priority"], "critical")
+        self.assertEqual(t["tags"], ["a"])
+        self.assertEqual(t["description"], "n")
+        self.assertEqual(t["due_date"], "2025-01-01")
+
+    def test_notion_push_respects_field_map(self):
+        d = grt.NotionDriver("notion", "notion://x", {
+            "databaseId": "abc", "token": "t",
+            "fieldMap.status": "Workflow",
+        })
+        with mock.patch.object(d, "_http_get",
+                                return_value={"properties": {"Name": {"type": "title"}}}), \
+                mock.patch.object(d, "_http_post") as post:
+            d.upsert(grt.empty_task() | {"id": "", "title": "t",
+                                           "status": "in_progress",
+                                           "priority": "none"})
+        body = post.call_args[1]["body"]
+        self.assertIn("Workflow", body["properties"])
+        self.assertNotIn("Status", body["properties"])
+
+
 class TestJiraDriver(unittest.TestCase):
     def setUp(self):
         self.d = grt.JiraDriver("jira", "https://x/y",
