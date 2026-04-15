@@ -350,15 +350,28 @@ ORG_TO_PRIORITY = {v: k for k, v in PRIORITY_TO_ORG.items()}
 
 
 def _iso_to_org_timestamp(iso: str, active: bool = False) -> str:
-    """Convert an ISO8601 string to an org timestamp; returns [...] or <...>."""
+    """Convert an ISO8601 string to an org timestamp; returns [...] or <...>.
+
+    Preserves the original timezone offset in the timestamp body so an agenda
+    user sees the local hour the upstream service reported. A trailing
+    '+HHMM' / '-HHMM' / 'Z' is appended when the source string carried an
+    offset; naive ISO strings emit a body without an offset (assumed UTC
+    for parseback).
+    """
     s = iso.replace("Z", "+00:00")
     try:
         if "T" in s:
             dt = datetime.fromisoformat(s)
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            dt = dt.astimezone(timezone.utc)
-            body = dt.strftime("%Y-%m-%d %a %H:%M")
+                body = dt.strftime("%Y-%m-%d %a %H:%M")
+            else:
+                offset = dt.utcoffset()
+                total = int(offset.total_seconds()) if offset is not None else 0
+                sign = "+" if total >= 0 else "-"
+                total = abs(total)
+                hh, mm = divmod(total // 60, 60)
+                offset_str = "Z" if total == 0 else f"{sign}{hh:02d}{mm:02d}"
+                body = dt.strftime("%Y-%m-%d %a %H:%M") + " " + offset_str
         else:
             dt = datetime.fromisoformat(s)
             body = dt.strftime("%Y-%m-%d %a")
@@ -367,22 +380,35 @@ def _iso_to_org_timestamp(iso: str, active: bool = False) -> str:
     return f"<{body}>" if active else f"[{body}]"
 
 
+_ORG_TIMESTAMP_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})"            # date
+    r"(?:\s+[A-Za-z]+)?"                # optional weekday
+    r"(?:\s+(\d{1,2}:\d{2}))?"          # optional time
+    r"(?:\s+([+-]\d{2}:?\d{2}|Z))?"     # optional offset
+    r"\s*$"
+)
+
+
 def _org_timestamp_to_iso(token: str) -> str:
-    """Parse [YYYY-MM-DD Day HH:MM] / <YYYY-MM-DD Day> → ISO8601."""
+    """Parse an org timestamp (with optional offset) → ISO8601."""
     token = token.strip()
     if token and token[0] in "[<" and token[-1] in "]>":
         inner = token[1:-1]
     else:
         inner = token
-    m = re.match(r"^(\d{4}-\d{2}-\d{2})(?:\s+[A-Za-z]+)?(?:\s+(\d{1,2}:\d{2}))?\s*$", inner)
+    m = _ORG_TIMESTAMP_RE.match(inner)
     if not m:
         return inner
     date_part = m.group(1)
     time_part = m.group(2)
-    if time_part:
-        hh, mm = time_part.split(":")
+    offset_part = m.group(3)
+    if not time_part:
+        return date_part
+    hh, mm = time_part.split(":")
+    if offset_part in (None, "Z"):
         return f"{date_part}T{int(hh):02d}:{mm}:00Z"
-    return date_part
+    off = offset_part.replace(":", "")
+    return f"{date_part}T{int(hh):02d}:{mm}:00{off[:3]}:{off[3:]}"
 
 
 class OrgSerializer(Serializer):

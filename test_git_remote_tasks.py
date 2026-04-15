@@ -1376,6 +1376,22 @@ class TestOrgEdgeCases(unittest.TestCase):
         token = grt._iso_to_org_timestamp("2025-04-20T12:30:00+03:00")
         self.assertTrue(token.startswith("[2025-04-20 Sun"))
 
+    def test_iso_offset_preserved_in_body(self):
+        token = grt._iso_to_org_timestamp("2025-04-20T12:30:00+03:00")
+        # Original offset survives to the emitted body.
+        self.assertIn("+0300", token)
+        self.assertIn("12:30", token)
+
+    def test_iso_offset_roundtrip(self):
+        token = grt._iso_to_org_timestamp("2025-04-20T12:30:00+03:00")
+        back = grt._org_timestamp_to_iso(token)
+        self.assertEqual(back, "2025-04-20T12:30:00+03:00")
+
+    def test_iso_utc_roundtrip(self):
+        token = grt._iso_to_org_timestamp("2025-04-20T12:30:00Z")
+        back = grt._org_timestamp_to_iso(token)
+        self.assertEqual(back, "2025-04-20T12:30:00Z")
+
     def test_iso_naive_datetime_assumed_utc(self):
         token = grt._iso_to_org_timestamp("2025-04-20T00:00:00")
         self.assertIn("2025-04-20", token)
