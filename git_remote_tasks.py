@@ -11,6 +11,20 @@ from the URL argument.
 
 Supported file formats: YAML and Org-mode. Format is chosen once per repo
 in .git/config under [tasks] format=... and applies to all remotes.
+
+Layout (top-to-bottom):
+
+    1. Unified schema          — empty_task / normalize_task / is_safe_task_id
+    2. Serializers             — YAMLSerializer, OrgSerializer
+    3. Config reader           — CaseInsensitiveConfig, read/write/unset helpers
+    4. Driver base + drivers   — Driver, Jira/Vikunja/MSTodo/Notion
+    5. Protocol handler        — ProtocolHandler (import/export over stdio)
+    6. Management subcommands  — install / uninstall / check / init / reset / version
+    7. Entry point             — main(), scheme dispatch, symlink naming
+
+Each driver owns four API-facing methods: fetch_all, fetch_changed,
+upsert, delete. Cross-source ids are refused in the base class'
+_native_id so writes are synchronous failures.
 """
 
 from __future__ import annotations

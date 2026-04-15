@@ -1,7 +1,9 @@
-"""Live integration tests against the user's personal services.
+"""Live integration tests against real services.
 
 Runs end-to-end exercises of the helper against Vikunja, Jira, and Notion
-using credentials from /Users/md/dev/incubation/todo-harvest/config.yaml.
+using credentials from a todo-harvest-style config.yaml. Point
+`GRT_LIVE_CONFIG` at your config file to run; the harness skips with a
+clear message when the env var is unset.
 
 Safety rules (enforced programmatically):
   - Never delete anything on any service. The driver.delete path is not
@@ -19,7 +21,7 @@ push one new task, update that task, fetch again, assert visibility
 at each step.
 
 Run with:
-    .venv/bin/python test_live_integration.py
+    GRT_LIVE_CONFIG=/path/to/config.yaml python test_live_integration.py
 
 Exit code reflects combined success/failure.
 """
@@ -65,14 +67,27 @@ def _strip_quotes(s: str) -> str:
     return s
 
 
+def _config_path() -> Path | None:
+    """Return the live-config path from $GRT_LIVE_CONFIG, or None if unset."""
+    raw = os.environ.get("GRT_LIVE_CONFIG")
+    return Path(raw).expanduser() if raw else None
+
+
 def _load_yaml_config() -> dict:
     """Minimal YAML reader covering the shapes we use in this project.
 
     Handles: top-level sections, single-level scalar keys, nested dicts of
-    scalar keys, and lists of scalars. Two-space indent units are assumed
-    (which is what the user's config uses). Not a general YAML parser.
+    scalar keys, and lists of scalars. Two-space indent units are assumed.
+    Not a general YAML parser.
+
+    Raises unittest.SkipTest when the config path is not configured so a
+    bare `python test_live_integration.py` doesn't error — it skips.
     """
-    path = Path("/Users/md/dev/incubation/todo-harvest/config.yaml")
+    path = _config_path()
+    if path is None or not path.exists():
+        raise unittest.SkipTest(
+            "set GRT_LIVE_CONFIG=/path/to/config.yaml to run live tests"
+        )
     lines = path.read_text(encoding="utf-8").splitlines()
 
     def tokenize():

@@ -45,7 +45,7 @@ via symlinks.
 
 ```bash
 # 1. Clone or copy the script.
-git clone https://example.com/git-remote-tasks.git ~/src/git-remote-tasks
+git clone https://github.com/mmdemirbas/git-remote-tasks.git ~/src/git-remote-tasks
 cd ~/src/git-remote-tasks
 
 # 2. Install the per-scheme symlinks onto PATH.
@@ -436,9 +436,9 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m unittest test_git_remote_tasks test_yaml_parser_fuzz
 
-# End-to-end against live services (needs
-# /Users/md/dev/incubation/todo-harvest/config.yaml style credentials).
-python test_live_integration.py
+# End-to-end against live services. Set GRT_LIVE_CONFIG to a
+# todo-harvest-style config.yaml containing your credentials.
+GRT_LIVE_CONFIG=/path/to/config.yaml python test_live_integration.py
 ```
 
 The live test harness never deletes or modifies items that it did not

@@ -17,9 +17,9 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m unittest test_git_remote_tasks test_yaml_parser_fuzz
 
-# Live end-to-end tests against real services (uses
-# /Users/md/dev/incubation/todo-harvest/config.yaml).
-python test_live_integration.py
+# Live end-to-end tests against real services. Set GRT_LIVE_CONFIG to a
+# todo-harvest-style config.yaml; tests skip cleanly when unset.
+GRT_LIVE_CONFIG=/path/to/config.yaml python test_live_integration.py
 
 # Install / uninstall the per-scheme symlinks.
 python git_remote_tasks.py install --bin-dir ~/.local/bin
