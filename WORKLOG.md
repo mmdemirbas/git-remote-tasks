@@ -208,3 +208,41 @@ implementation is in git history and PLAN.md tracks forward work,
 SPEC.md is redundant. Git preserves it at commit `8600dde` if we ever
 need to look back. Removed in the same commit batch as the plan
 update.
+
+## 2026-04-15 — Remaining features landed; PLAN reduced to invariants
+
+Through commits `893baad` … `0b2a91f` every backlog item from PLAN.md
+shipped:
+
+- `893baad` DX-01 / DX-04 tasks-init switched to positional path.
+- `aaf4b93` / `7102031` / `8d60c55` / `ab94397` write paths for
+  Vikunja, Jira, MS Todo, Notion. Each refuses cross-source ids with
+  a driver-specific error class so silent duplication is impossible.
+- `8d60c55` MSAL device-code flow with refresh-token persistence.
+- `bbd1f2c` incremental fetch infrastructure + Jira / Vikunja
+  driver overrides. MS Todo and Notion keep the base fallback for now
+  (tracked as FEAT-06b / FEAT-06c in PLAN §2.1).
+- `a95c30a` the bash `tasks-init` script is gone; its behaviour moves
+  into `python git_remote_tasks.py init [path]` with `tasks-init` as
+  a symlink alongside `git-remote-*`. Single-file distribution is
+  restored.
+- `949cdf4` FEAT-03 `statusMap.*` / `priorityMap.*` / `fieldMap.*`
+  wired into every driver, bidirectionally.
+- `0b2a91f` the cleanup batch: FEAT-05 org DEADLINE on agenda line,
+  BUG-06 hyphens in YAML nested keys, BUG-08 no more `jira://` links,
+  BUG-10 msftodo one-of required keys, BUG-11 org drawer terminates
+  on stray headline, DX-02 debug traceback on
+  `GIT_REMOTE_TASKS_DEBUG=1`, DX-03 install prints source path.
+
+Tests: 247 in the default suite, 258 with hypothesis in `.venv`.
+DONE.md now catalogues every resolved ID with its commit. PLAN.md is
+reduced to invariants, two open driver-specific incrementals
+(FEAT-06b / FEAT-06c), explicit out-of-scope, and a how-to-add-a-
+service runbook.
+
+Next: a second adversarial review of the current codebase — not the
+same spots as the first, because those are fixed. Fresh axes:
+concurrency / race conditions on sync state, error resilience under
+network failure, UX when credentials expire mid-run, config drift
+when a remote is renamed, partial-failure semantics during batch
+pushes.
