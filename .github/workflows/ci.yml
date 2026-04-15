@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs on the same ref; the tail one wins.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: unittest (stdlib) on Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run stdlib test suite
+        # The default suite imports only the standard library. This matches
+        # the shipped runtime: git_remote_tasks.py itself is stdlib-only.
+        run: python -m unittest -v test_git_remote_tasks
+
+  fuzz:
+    name: hypothesis fuzz (YAML parser)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test-only deps
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements-dev.txt
+      - name: Run hypothesis fuzz suite
+        # `test_yaml_parser_fuzz` exists only to exercise the hand-written
+        # YAML parser against Hypothesis-generated inputs. It is opt-in
+        # because the shipped script stays dependency-free.
+        run: .venv/bin/python -m unittest -v test_yaml_parser_fuzz
