@@ -31,7 +31,7 @@ for the full context.
 | FEAT-07 | bbd1f2c | Per-file `M` / `D` directives when incremental state exists; full snapshot only on first fetch.      |
 | FEAT-08 | ab94397 | Notion push: POST create, PATCH update, archive-on-delete. Title column auto-discovered.             |
 | BUG-08  | 0b2a91f | Jira `task.url` falls back only to a real http(s) base; never emits `jira://...` links.              |
-| BUG-10  | 0b2a91f | `cmd_check` reports `accessToken or clientId` as a one-of requirement for msftodo.                   |
+| BUG-10  | 0b2a91f | `cmd_check` reports `accessToken or clientId` as a one-of requirement for mstodo.                   |
 | BUG-11  | 0b2a91f | Org `_parse_properties` terminates cleanly on a stray `* ` headline.                                 |
 | DX-04   | 893baad | `tasks-init` accepts a positional path (`git init [path]` shape); `--dir` kept as deprecated alias.  |
 

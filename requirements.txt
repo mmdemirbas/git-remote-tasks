@@ -2,4 +2,4 @@
 # The single optional dependency is only needed for MS To Do
 # device-code OAuth; import is guarded at runtime.
 
-msal>=1.24 ; extra == "msftodo"
+msal>=1.24 ; extra == "mstodo"

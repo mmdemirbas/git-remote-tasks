@@ -51,7 +51,7 @@ which git-remote-jira
 ```
 
 `install` creates four symlinks on the target dir (`git-remote-jira`,
-`git-remote-vikunja`, `git-remote-msftodo`, `git-remote-notion`) — all pointing
+`git-remote-vikunja`, `git-remote-mstodo`, `git-remote-notion`) — all pointing
 back to `git_remote_tasks.py`. The script decides which service to drive by
 reading its own `argv[0]` basename.
 
@@ -114,7 +114,7 @@ Examples:
 |-----------|--------------------------------------|----------------------------------------|
 | `jira`    | `jira://company.atlassian.net`       | Host portion is informational.         |
 | `vikunja` | `vikunja://localhost:3456`           | Or remote `vikunja://vikunja.local`.   |
-| `msftodo` | `msftodo://consumers`                | Tenant: `consumers`, `organizations`.  |
+| `mstodo` | `mstodo://consumers`                | Tenant: `consumers`, `organizations`.  |
 | `notion`  | `notion://db-<id>`                   | Suffix is purely cosmetic.             |
 
 The URL is recorded by git and passed to the helper; all real credentials live
@@ -136,13 +136,13 @@ Per-remote (`tasks-remote.<name>.*`):
 
 | Key            | Scheme(s) | Description                                  |
 |----------------|-----------|----------------------------------------------|
-| `scheme`       | all       | `jira` / `vikunja` / `msftodo` / `notion`.   |
+| `scheme`       | all       | `jira` / `vikunja` / `mstodo` / `notion`.   |
 | `baseUrl`      | jira, vikunja | Service base URL.                        |
 | `email`        | jira      | Your Atlassian account email.                |
 | `apiToken`     | jira, vikunja | Service API token.                       |
-| `tenantId`     | msftodo   | MSAL tenant (`consumers` for personal).      |
-| `clientId`     | msftodo   | Registered Azure AD client ID.               |
-| `accessToken`  | msftodo   | Optional pre-acquired bearer token.          |
+| `tenantId`     | mstodo   | MSAL tenant (`consumers` for personal).      |
+| `clientId`     | mstodo   | Registered Azure AD client ID.               |
+| `accessToken`  | mstodo   | Optional pre-acquired bearer token.          |
 | `databaseId`   | notion    | Target database ID.                          |
 | `token`        | notion    | Integration token (bearer).                  |
 | `databaseTitle`| notion    | Optional friendly category name.             |
@@ -237,8 +237,8 @@ git config tasks-remote.jira-work.sync.mode incremental
 4. Configure the remote:
 
    ```bash
-   git remote add todo msftodo://consumers
-   git config tasks-remote.todo.scheme    msftodo
+   git remote add todo mstodo://consumers
+   git config tasks-remote.todo.scheme    mstodo
    git config tasks-remote.todo.tenantId  consumers
    git config tasks-remote.todo.clientId  "$CLIENT_ID"
    ```

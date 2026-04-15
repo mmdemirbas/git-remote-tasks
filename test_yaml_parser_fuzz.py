@@ -108,7 +108,7 @@ if HYPOTHESIS_AVAILABLE:
             },
             tid=st.text(alphabet="abcdefghijklmnopqrstuvwxyz-0123456789",
                         min_size=1, max_size=20),
-            src=st.sampled_from(["jira", "vikunja", "msftodo", "notion", "fake"]),
+            src=st.sampled_from(["jira", "vikunja", "mstodo", "notion", "fake"]),
             title=_SAFE_ONELINER,
             desc=st.one_of(st.none(), _SAFE_TEXT),
             status=_STATUS,

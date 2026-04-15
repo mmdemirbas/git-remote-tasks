@@ -29,7 +29,7 @@ the global "prefer pytest" rule. Do not convert tests to pytest.
 ## Architecture
 
 `git_remote_tasks.py` is a single-file implementation of four git remote
-helpers (`jira`, `vikunja`, `msftodo`, `notion`). The active scheme is
+helpers (`jira`, `vikunja`, `mstodo`, `notion`). The active scheme is
 resolved from `argv[0]` basename when invoked by git, or from the URL scheme
 when run directly. `install` materializes this as four symlinks all pointing
 at the same script.

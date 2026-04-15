@@ -79,7 +79,7 @@ The template is stable enough to write down:
 2. Register it in `SCHEMES` at the bottom of the file.
 3. Add required-keys to `REMOTE_REQUIRED_KEYS`; widen
    `_missing_required_keys` if the service has a one-of requirement
-   (see msftodo accessToken vs clientId).
+   (see mstodo accessToken vs clientId).
 4. Tests: normalize fixtures, fetch pagination, fetch_changed with
    `since`, upsert (update + create), delete, cross-source refusal.
 5. README §7 add a row; §8 add a setup block.

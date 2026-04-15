@@ -122,7 +122,7 @@ findings with three product decisions the user raised:
   including unrelated helpers installed into the same bin dir.
 - **Secret redaction in `check`** matches only `token`/`password`
   substrings, leaking `apiKey`, `clientSecret`, `access*`, etc.
-- Plus: Jira task URL falls back to the `jira://` scheme, `msftodo`
+- Plus: Jira task URL falls back to the `jira://` scheme, `mstodo`
   `check` passes without a token, org `:DEADLINE:` is stored as a
   property (not agenda-visible), YAML nested hyphen keys vanish.
 
@@ -230,7 +230,7 @@ shipped:
   wired into every driver, bidirectionally.
 - `0b2a91f` the cleanup batch: FEAT-05 org DEADLINE on agenda line,
   BUG-06 hyphens in YAML nested keys, BUG-08 no more `jira://` links,
-  BUG-10 msftodo one-of required keys, BUG-11 org drawer terminates
+  BUG-10 mstodo one-of required keys, BUG-11 org drawer terminates
   on stray headline, DX-02 debug traceback on
   `GIT_REMOTE_TASKS_DEBUG=1`, DX-03 install prints source path.
 

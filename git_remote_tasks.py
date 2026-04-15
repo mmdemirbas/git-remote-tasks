@@ -715,7 +715,7 @@ def read_format() -> str:
 REMOTE_REQUIRED_KEYS = {
     "jira":     ("baseUrl", "email", "apiToken"),
     "vikunja":  ("baseUrl", "apiToken"),
-    "msftodo":  ("tenantId", "clientId"),
+    "mstodo":  ("tenantId", "clientId"),
     "notion":   ("databaseId", "token"),
 }
 
@@ -1079,7 +1079,7 @@ class Driver(ABC):
         return default
 
     # ---- Push-side shared helpers ----
-    _CROSS_SOURCE_PREFIXES = ("jira-", "vikunja-", "msftodo-", "notion-")
+    _CROSS_SOURCE_PREFIXES = ("jira-", "vikunja-", "mstodo-", "notion-")
 
     def _native_id(self, task_id: str) -> str | None:
         """Strip the `<scheme>-` prefix from a unified id.
@@ -1655,7 +1655,7 @@ class MSTodoPushError(RuntimeError):
 
 
 class MSTodoDriver(Driver):
-    SCHEME = "msftodo"
+    SCHEME = "mstodo"
 
     def _cross_source_error(self):
         return MSTodoPushError
@@ -1743,8 +1743,8 @@ class MSTodoDriver(Driver):
     def normalize(self, task: dict, list_name: str | None = None) -> dict:
         t = empty_task()
         tid = task.get("id")
-        t["id"] = f"msftodo-{tid}" if tid else ""
-        t["source"] = "msftodo"
+        t["id"] = f"mstodo-{tid}" if tid else ""
+        t["source"] = "mstodo"
         t["title"] = task.get("title") or ""
         body = task.get("body") or {}
         t["description"] = body.get("content") if isinstance(body, dict) else None
@@ -2194,7 +2194,7 @@ class NotionDriver(Driver):
 SCHEMES: dict[str, type[Driver]] = {
     "jira": JiraDriver,
     "vikunja": VikunjaDriver,
-    "msftodo": MSTodoDriver,
+    "mstodo": MSTodoDriver,
     "notion": NotionDriver,
 }
 
@@ -2906,12 +2906,12 @@ def _redact_config_value(key: str) -> bool:
 def _missing_required_keys(scheme: str, config: dict) -> list[str]:
     """Return a sorted list of required-key descriptions that are unset.
 
-    One-of requirements (BUG-10 for msftodo auth) are rendered as
+    One-of requirements (BUG-10 for mstodo auth) are rendered as
     'keyA or keyB' so the operator sees the choice.
     """
     required = REMOTE_REQUIRED_KEYS.get(scheme, ())
     missing = [k for k in required if not config.get(k)]
-    if scheme == "msftodo":
+    if scheme == "mstodo":
         # Either accessToken OR clientId (MSAL device flow) must be set.
         if not config.get("accessToken") and not config.get("clientId"):
             missing.append("accessToken or clientId")

@@ -337,19 +337,19 @@ class TestBug08JiraUrl(unittest.TestCase):
 class TestBug10MsftodoCheck(unittest.TestCase):
     def test_missing_access_token_and_client_id(self):
         missing = grt._missing_required_keys(
-            "msftodo", {"scheme": "msftodo", "tenantId": "consumers"})
+            "mstodo", {"scheme": "mstodo", "tenantId": "consumers"})
         self.assertIn("accessToken or clientId", missing)
 
     def test_access_token_alone_is_sufficient(self):
         missing = grt._missing_required_keys(
-            "msftodo", {"scheme": "msftodo", "tenantId": "consumers",
+            "mstodo", {"scheme": "mstodo", "tenantId": "consumers",
                          "clientId": "",
                          "accessToken": "t"})
         self.assertNotIn("accessToken or clientId", missing)
 
     def test_client_id_alone_is_sufficient(self):
         missing = grt._missing_required_keys(
-            "msftodo", {"scheme": "msftodo", "tenantId": "consumers",
+            "mstodo", {"scheme": "mstodo", "tenantId": "consumers",
                          "clientId": "c"})
         self.assertNotIn("accessToken or clientId", missing)
 
@@ -542,7 +542,7 @@ class TestCrossSourceRefusalAllDrivers(unittest.TestCase):
             d.upsert(full_task(id="jira-PROJ-1"))
 
     def test_mstodo_refuses_notion_id(self):
-        d = grt.MSTodoDriver("m", "msftodo://x",
+        d = grt.MSTodoDriver("m", "mstodo://x",
                                {"accessToken": "t"})
         with self.assertRaises(grt.MSTodoPushError):
             d.upsert(full_task(id="notion-abc"))
@@ -602,7 +602,7 @@ class TestSafeTaskId(unittest.TestCase):
 
     def test_happy_paths(self):
         for ok_id in ("jira-PROJ-1", "vikunja-42", "notion-abc-def",
-                       "msftodo-AAAAAA_BBB", "a", "z9", "a.b-c_d"):
+                       "mstodo-AAAAAA_BBB", "a", "z9", "a.b-c_d"):
             self.assertTrue(grt.is_safe_task_id(ok_id),
                              f"should be safe: {ok_id!r}")
 
@@ -1490,7 +1490,7 @@ class TestVikunjaDriver(unittest.TestCase):
 
 class TestMSTodoDriver(unittest.TestCase):
     def setUp(self):
-        self.d = grt.MSTodoDriver("msftodo", "msftodo://consumers",
+        self.d = grt.MSTodoDriver("mstodo", "mstodo://consumers",
                                   {"accessToken": "tok"})
 
     def test_importance_mapping(self):
@@ -1550,7 +1550,7 @@ class TestMSTodoDriver(unittest.TestCase):
         self.assertEqual(tasks[0]["category"]["name"], "Inbox")
 
     def test_fetch_all_requires_auth(self):
-        d = grt.MSTodoDriver("msftodo", "msftodo://consumers", {})
+        d = grt.MSTodoDriver("mstodo", "mstodo://consumers", {})
         with mock.patch.object(grt, "MSAL_AVAILABLE", False):
             with self.assertRaises(NotImplementedError):
                 d.fetch_all()
@@ -1560,7 +1560,7 @@ class TestMSTodoDriver(unittest.TestCase):
         def fake_patch(url, body=None, headers=None):
             patches.append((url, body))
             return {}
-        task = full_task(id="msftodo-T1", source="msftodo",
+        task = full_task(id="mstodo-T1", source="mstodo",
                          category={"id": "L-abc", "name": "Inbox", "type": "list"},
                          title="hello", status="in_progress")
         with mock.patch.object(self.d, "_http_patch", side_effect=fake_patch):
@@ -1576,7 +1576,7 @@ class TestMSTodoDriver(unittest.TestCase):
         def fake_post(url, body=None, headers=None):
             posts.append(url)
             return {}
-        task = full_task(id="msftodo-", category={"id": None, "name": None,
+        task = full_task(id="mstodo-", category={"id": None, "name": None,
                                                    "type": "other"})
         with mock.patch.object(self.d, "_http_post", side_effect=fake_post):
             self.d.upsert(task)
@@ -1590,10 +1590,10 @@ class TestMSTodoDriver(unittest.TestCase):
 
     def test_delete_requires_default_list_id(self):
         with self.assertRaises(grt.MSTodoPushError):
-            self.d.delete("msftodo-T1")
+            self.d.delete("mstodo-T1")
         self.d.config["defaultListId"] = "L-x"
         with mock.patch.object(self.d, "_http_delete") as hd:
-            self.d.delete("msftodo-T1")
+            self.d.delete("mstodo-T1")
         self.assertTrue(hd.call_args[0][0].endswith("/me/todo/lists/L-x/tasks/T1"))
 
     def test_delete_refuses_cross_source(self):
@@ -1604,7 +1604,7 @@ class TestMSTodoDriver(unittest.TestCase):
 
 class TestMSTodoAuth(unittest.TestCase):
     def setUp(self):
-        self.d = grt.MSTodoDriver("msftodo", "msftodo://consumers", {})
+        self.d = grt.MSTodoDriver("mstodo", "mstodo://consumers", {})
 
     def test_access_token_short_circuits(self):
         self.d.config["accessToken"] = "tok"
