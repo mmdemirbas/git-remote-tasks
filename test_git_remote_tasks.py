@@ -760,6 +760,165 @@ class TestNotionIncremental(unittest.TestCase):
             d.fetch_changed("2026-04-15T00:00:00Z")
 
 
+class TestCoverageGaps(unittest.TestCase):
+    """Negative paths and corner cases that earlier batches missed."""
+
+    # ---- CaseInsensitiveConfig ------------------------------------------------
+    def test_case_insensitive_pop(self):
+        c = grt.CaseInsensitiveConfig({"BaseUrl": "x"})
+        self.assertEqual(c.pop("BASEURL"), "x")
+        self.assertEqual(c.pop("missing", "fallback"), "fallback")
+
+    def test_case_insensitive_setdefault_preserves_existing(self):
+        c = grt.CaseInsensitiveConfig({"BaseUrl": "x"})
+        self.assertEqual(c.setdefault("baseurl", "fallback"), "x")
+        self.assertEqual(c.setdefault("apiToken", "tok"), "tok")
+        self.assertEqual(c.get("apitoken"), "tok")
+
+    # ---- write_config_value / unset_config_values ---------------------------
+    def test_write_config_value_subprocess_timeout(self):
+        with mock.patch.object(subprocess, "run",
+                                side_effect=subprocess.TimeoutExpired("git", 10)), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            self.assertFalse(grt.write_config_value("k", "v"))
+
+    def test_unset_config_values_nothing_to_unset_is_ok(self):
+        with mock.patch.object(grt, "_run_git_config", return_value=None):
+            self.assertTrue(grt.unset_config_values("never.matches"))
+
+    def test_unset_config_values_partial_failure(self):
+        out = ("tasks-remote.x.sync.lastFetchAt 2025-01-01\n"
+               "tasks-remote.x.sync.pending.since y\n")
+        results = iter([
+            mock.Mock(returncode=0, stdout="", stderr=""),
+            mock.Mock(returncode=1, stdout="", stderr="boom"),
+        ])
+        with mock.patch.object(grt, "_run_git_config", return_value=out), \
+                mock.patch.object(subprocess, "run",
+                                   side_effect=lambda *a, **k: next(results)):
+            self.assertFalse(grt.unset_config_values("^.*"))
+
+    # ---- _redact_http_error preserves the bare path -------------------------
+    def test_redact_http_error_preserves_path_drops_query(self):
+        exc = urllib.error.HTTPError(
+            "https://x/api?token=secret", 401, "Unauthorized",
+            hdrs=None, fp=None,
+        )
+        red = grt.Driver._redact_http_error(exc, "https://x/api?token=secret")
+        self.assertEqual(red.code, 401)
+        self.assertIn("https://x/api", str(red))
+        self.assertNotIn("token=secret", str(red))
+
+    # ---- JiraDriver._strip_order_by ----------------------------------------
+    def test_strip_order_by_with_no_order_clause(self):
+        self.assertEqual(
+            grt.JiraDriver._strip_order_by("project = MD"),
+            "project = MD",
+        )
+
+    def test_strip_order_by_case_insensitive(self):
+        self.assertEqual(
+            grt.JiraDriver._strip_order_by("a = b order by created"),
+            "a = b",
+        )
+
+    # ---- VikunjaDriver: non-numeric native id rejected ----------------------
+    def test_vikunja_non_numeric_native_id_refused(self):
+        d = grt.VikunjaDriver("v", "http://x",
+                                {"baseUrl": "http://x", "apiToken": "t"})
+        with self.assertRaises(grt.VikunjaPushError):
+            d.upsert(grt.empty_task() | {"id": "vikunja-not-a-number",
+                                            "title": "x"})
+
+    # ---- MSAL device flow init failure --------------------------------------
+    def test_msal_device_flow_init_returns_error(self):
+        d = grt.MSTodoDriver("m", "mstodo://x", {"clientId": "c"})
+        fake_app = mock.Mock()
+        fake_app.initiate_device_flow.return_value = {"error": "oops"}
+        fake_msal = mock.Mock()
+        fake_msal.PublicClientApplication.return_value = fake_app
+        with mock.patch.object(grt, "MSAL_AVAILABLE", True), \
+                mock.patch.object(grt, "msal", fake_msal, create=True):
+            with self.assertRaises(NotImplementedError):
+                d._acquire_token()
+
+    def test_msal_device_flow_acquire_returns_no_token(self):
+        d = grt.MSTodoDriver("m", "mstodo://x", {"clientId": "c"})
+        fake_app = mock.Mock()
+        fake_app.initiate_device_flow.return_value = {
+            "user_code": "X", "verification_uri": "http://example",
+            "message": "Visit http://example",
+        }
+        fake_app.acquire_token_by_device_flow.return_value = {
+            "error_description": "user denied",
+        }
+        fake_msal = mock.Mock()
+        fake_msal.PublicClientApplication.return_value = fake_app
+        with mock.patch.object(grt, "MSAL_AVAILABLE", True), \
+                mock.patch.object(grt, "msal", fake_msal, create=True), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaises(NotImplementedError):
+                d._acquire_token()
+
+    # ---- MSAL refresh persistence failure surface --------------------------
+    def test_msal_refresh_persist_failure_warns(self):
+        d = grt.MSTodoDriver("m", "mstodo://x", {})
+        with mock.patch.object(grt, "write_config_value",
+                                return_value=False), \
+                mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            d._store_refresh("rt")
+        self.assertIn("msal-persist", err.getvalue())
+
+    # ---- NotionDriver._invert_map -----------------------------------------
+    def test_notion_invert_empty_map_safe(self):
+        d = grt.NotionDriver("n", "notion://x",
+                                {"databaseId": "x", "token": "t"})
+        self.assertEqual(d._invert_map("statusMap"), {})
+
+    def test_notion_invert_first_upstream_wins_on_collision(self):
+        d = grt.NotionDriver("n", "notion://x", {
+            "databaseId": "x", "token": "t",
+            "statusMap": '{"Done": "done", "Shipped": "done"}',
+        })
+        # Either is valid; we just need to know it's deterministic.
+        inverted = d._invert_map("statusMap")
+        self.assertEqual(inverted["done"], "Done")
+
+    # ---- _emit_blobs renumbers when some ids are unsafe --------------------
+    def test_emit_blobs_marks_are_contiguous_after_skips(self):
+        h = grt.ProtocolHandler("fake", "fake://x", FakeDriver(),
+                                 grt.YAMLSerializer(),
+                                 stdin=io.StringIO(""),
+                                 stdout=FlushTrackingStringIO(),
+                                 stderr=io.StringIO())
+        good1 = grt.empty_task() | {"id": "fake-a", "source": "fake",
+                                       "title": "a"}
+        bad   = grt.empty_task() | {"id": "../escape", "source": "fake",
+                                       "title": "x"}
+        good2 = grt.empty_task() | {"id": "fake-b", "source": "fake",
+                                       "title": "b"}
+        blobs = h._emit_blobs([good1, bad, good2], "yaml")
+        self.assertEqual([m for m, _, _ in blobs], [1, 2])
+        self.assertEqual([p for _, _, p in blobs],
+                          ["tasks/fake-a.yaml", "tasks/fake-b.yaml"])
+
+    # ---- cmd_init rejects non-yaml/non-org format --------------------------
+    def test_cmd_init_invalid_format(self):
+        ns = mock.Mock(format="xml", path=None)
+        ns._input_fn = lambda _p: "yaml"
+        with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            rc = grt.cmd_init(ns)
+        self.assertEqual(rc, 2)
+        self.assertIn("yaml", err.getvalue())
+
+    # ---- _is_safe_tasks_path negative cases --------------------------------
+    def test_is_safe_tasks_path_rejects_subdirs(self):
+        self.assertFalse(grt._is_safe_tasks_path("tasks/a/b.yaml"))
+        self.assertFalse(grt._is_safe_tasks_path("tasks/.hidden"))
+        self.assertFalse(grt._is_safe_tasks_path("notes/a.yaml"))
+        self.assertFalse(grt._is_safe_tasks_path("tasks/"))
+
+
 class TestVikunjaEndpointFallback(unittest.TestCase):
     def test_primary_path_used_first(self):
         d = grt.VikunjaDriver("v", "http://x",

@@ -57,14 +57,17 @@ _SAFE_TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
 def _is_safe_tasks_path(path: str) -> bool:
     """Return True when `path` is exactly `tasks/<id>.<ext>` with no traversal.
 
-    Rejects `tasks/../etc/passwd`, `tasks//foo.yaml`, and any path that
-    pathlib normalizes to something outside `tasks/`. Used at every
-    import/export boundary alongside `is_safe_task_id`.
+    Rejects `tasks/../etc/passwd`, `tasks//foo.yaml`, leading-dot names
+    that could shadow git internals (`tasks/.git`), and anything pathlib
+    would normalize outside `tasks/`. Used at every import/export
+    boundary alongside `is_safe_task_id`.
     """
     if not path.startswith("tasks/"):
         return False
     rest = path[len("tasks/"):]
     if not rest or "/" in rest or "\\" in rest:
+        return False
+    if rest.startswith("."):
         return False
     if ".." in rest.split("."):
         return False
