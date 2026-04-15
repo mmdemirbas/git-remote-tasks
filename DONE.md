@@ -30,6 +30,8 @@ for the full context.
 | FEAT-06 | bbd1f2c | Incremental fetch: Jira JQL `updated >=`, Vikunja `filter=updated > '…'`; sync state in `.git/config`. |
 | FEAT-07 | bbd1f2c | Per-file `M` / `D` directives when incremental state exists; full snapshot only on first fetch.      |
 | FEAT-08 | ab94397 | Notion push: POST create, PATCH update, archive-on-delete. Title column auto-discovered.             |
+| FEAT-06b | 456a4ee | MS Todo incremental via Graph delta query. Delta link persisted per list; @removed tombstones become D. |
+| FEAT-06c | 456a4ee | Notion incremental via last_edited_time filter. Archived pages become D.                           |
 | BUG-08  | 0b2a91f | Jira `task.url` falls back only to a real http(s) base; never emits `jira://...` links.              |
 | BUG-10  | 0b2a91f | `cmd_check` reports `accessToken or clientId` as a one-of requirement for mstodo.                   |
 | BUG-11  | 0b2a91f | Org `_parse_properties` terminates cleanly on a stray `* ` headline.                                 |

@@ -30,25 +30,14 @@ This document survives in two halves:
 
 ## 2. Open items
 
-### 2.1 Incremental fetch for MS Todo and Notion
-
-The base `Driver.fetch_changed()` still delegates to `fetch_all()` for
-MS Todo and Notion; only Jira and Vikunja have driver-specific
-incrementals. Complete coverage:
-
-| ID       | Cat  | Title                                   | Detail                                                                                          |
-|----------|------|-----------------------------------------|-------------------------------------------------------------------------------------------------|
-| FEAT-06b | FEAT | MS Todo delta-query incremental fetch   | Use Graph `/me/todo/lists/{id}/tasks/delta` and persist `@odata.deltaLink` per list as `sync.deltaLink.<listId>`. Emits native `@removed` tombstones as `D` directives. |
-| FEAT-06c | FEAT | Notion `last_edited_time` filter        | Call `/databases/{id}/query` with `{"filter": {"property": "last_edited_time", "last_edited_time": {"after": "<iso>"}}}`. Archived pages come back with `archived: true` — emit as `D`. |
-
-### 2.2 Known weaker behaviour
+### 2.1 Known weaker behaviour
 
 | ID   | Cat | Title                                      | Workaround today                                                                                    |
 |------|-----|--------------------------------------------|------------------------------------------------------------------------------------------------------|
-| OPS-01 | DX | Jira / Vikunja upstream deletions          | Neither API has a native deletion feed. Operators flip `sync.mode full` periodically to reconcile. A `tasks-remote.<name>.reconcileInterval` helper is on the wish list. |
-| OPS-02 | DX | Concurrent push conflict handling          | If two pushes race the same page, the second overwrites the first. todo-harvest has a sqlite sync-map; we defer until there's a real user-facing collision. |
+| OPS-01 | DX | Jira / Vikunja upstream deletions          | Neither API has a native deletion feed. Operators flip `sync.mode full` periodically to reconcile, or run `python git_remote_tasks.py reset <remote>`. |
+| OPS-02 | DX | Concurrent push conflict handling          | If two pushes race the same item, the second overwrites the first. todo-harvest has a sqlite sync-map; we defer until there's a real user-facing collision. |
 
-### 2.3 Out of scope (will not do)
+### 2.2 Out of scope (will not do)
 
 - Replacing the hand-written YAML parser with PyYAML. Single-file
   distribution is the motivating constraint.

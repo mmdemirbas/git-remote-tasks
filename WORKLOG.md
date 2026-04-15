@@ -246,3 +246,63 @@ concurrency / race conditions on sync state, error resilience under
 network failure, UX when credentials expire mid-run, config drift
 when a remote is renamed, partial-failure semantics during batch
 pushes.
+
+## 2026-04-15 — Round-two review closures and public-release prep
+
+### Incremental fetch for every service
+
+FEAT-06b (MS Todo Graph delta) and FEAT-06c (Notion
+last_edited_time) shipped in `456a4ee`. Every driver now implements
+a real `fetch_changed(since)` — the base-class fallback to
+`fetch_all()` is still there for custom drivers, but all four
+shipped drivers override it:
+
+- Jira: JQL `(base) AND updated >= "<ts>" ORDER BY updated ASC`.
+- Vikunja: `filter=updated > '<ts>'`.
+- MS Todo: `/me/todo/lists/{id}/tasks/delta` with `@odata.deltaLink`
+  persisted per list under `sync.deltaLink.<hex(listId)>`. `@removed`
+  tombstones surface as `mstodo-<id>` deleted_ids — the only driver
+  with native upstream-deletion detection.
+- Notion: `/v1/databases/{id}/query` with the `last_edited_time`
+  filter and `archived:true` promoted into deleted_ids on
+  incremental runs (full snapshots filter archived pages out entirely).
+
+### Rename
+
+The `msftodo` scheme is now `mstodo` everywhere. Pure rename — no
+behaviour change. Commit `02a642b`.
+
+### Negative and edge-case tests
+
+17 new tests in `87aee37` covering: case-insensitive pop/setdefault,
+subprocess timeouts, unset-config partial failure, redacted-URL
+preservation, strip-order-by edge cases, Vikunja non-numeric id
+refused, MSAL device-flow failure paths, refresh persistence
+warning, Notion inverse map with empty and colliding entries,
+contiguous mark numbering after unsafe-id skips, cmd_init invalid
+format, leading-dot path rejection (feature added: `_is_safe_tasks_path`
+now refuses `tasks/.hidden` to avoid git-internal-name shadowing).
+
+Default suite 324 tests / 335 with hypothesis — all green.
+
+### Documentation refresh
+
+README rewritten end-to-end to drop stale claims ("MS Todo and Notion
+fall back to a full fetch", "Notion is pull-only" troubleshooting
+entry), and extended with:
+
+- A combined §7.1 table covering every sync-state key the helper
+  writes, including the per-list delta links.
+- A §7.2 rewrite with both dotted-key and JSON-encoded forms for
+  status/priority/field maps, and an explicit callout that Notion
+  push inverts the user's statusMap so the database's real options
+  are used.
+- Per-service setup bumped to current keys (`projectKey`,
+  `projectId`, `defaultListId`, `jql`).
+- New §13 Development section with venv + fuzz + live test commands.
+- New §14 Licence pointer.
+
+CLAUDE.md rewritten to match: removed "write paths are stubs" (none
+are stubs now), added the invariants introduced in later batches
+(path traversal, timezone offset round-trip, two-phase sync
+watermark, cross-source refusal synchronous).
