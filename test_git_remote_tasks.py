@@ -968,6 +968,42 @@ class TestSafeTaskId(unittest.TestCase):
         self.assertFalse(grt.is_safe_task_id("a" * 256))
 
 
+class TestPageSizeHelper(unittest.TestCase):
+    """`Driver._page_size()` reads config, falls back, and clamps."""
+
+    def _driver(self, cfg):
+        # Pick an arbitrary concrete driver; all share the helper.
+        return grt.JiraDriver("jira", "https://x/y",
+                              {"baseUrl": "https://x/y", "email": "a@b.c",
+                               "apiToken": "tok", **cfg})
+
+    def test_no_config_uses_driver_default(self):
+        self.assertEqual(self._driver({})._page_size(), 100)
+
+    def test_config_override(self):
+        self.assertEqual(self._driver({"pageSize": "42"})._page_size(), 42)
+
+    def test_non_numeric_config_falls_back_to_default(self):
+        self.assertEqual(self._driver({"pageSize": "abc"})._page_size(), 100)
+
+    def test_empty_string_falls_back_to_default(self):
+        self.assertEqual(self._driver({"pageSize": ""})._page_size(), 100)
+
+    def test_zero_or_negative_clamped_to_one(self):
+        self.assertEqual(self._driver({"pageSize": "0"})._page_size(), 1)
+        self.assertEqual(self._driver({"pageSize": "-5"})._page_size(), 1)
+
+    def test_above_max_clamped(self):
+        self.assertEqual(self._driver({"pageSize": "9999"})._page_size(), 100)
+
+    def test_per_driver_max_applies(self):
+        # Vikunja permits a higher ceiling than Jira.
+        v = grt.VikunjaDriver("v", "http://x",
+                               {"baseUrl": "http://x", "apiToken": "t",
+                                "pageSize": "9999"})
+        self.assertEqual(v._page_size(), grt.VikunjaDriver.PAGE_SIZE_MAX)
+
+
 class TestTaskFilePath(unittest.TestCase):
     """`_is_task_file_path` decides what a push treats as a real task file."""
 
@@ -1651,6 +1687,41 @@ class TestJiraDriver(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             d.fetch_all()
 
+    def test_default_page_size_is_100(self):
+        # Jira Cloud caps /search/jql at 100 per request; we now use that
+        # ceiling by default instead of 50.
+        self.assertEqual(grt.JiraDriver.PAGE_SIZE_DEFAULT, 100)
+        self.assertEqual(grt.JiraDriver.PAGE_SIZE_MAX, 100)
+        captured = []
+        def fake_get(url, headers=None):
+            captured.append(url)
+            return {"issues": [], "isLast": True}
+        with mock.patch.object(self.d, "_http_get", side_effect=fake_get):
+            self.d.fetch_all()
+        self.assertIn("maxResults=100", captured[0])
+
+    def test_page_size_override_and_clamp(self):
+        # Values over PAGE_SIZE_MAX are clamped (service would 400 anyway).
+        self.d.config["pageSize"] = "500"
+        captured = []
+        def fake_get(url, headers=None):
+            captured.append(url)
+            return {"issues": [], "isLast": True}
+        with mock.patch.object(self.d, "_http_get", side_effect=fake_get):
+            self.d.fetch_all()
+        self.assertIn("maxResults=100", captured[0])
+
+    def test_page_size_legacy_endpoint_honors_override(self):
+        self.d.config["searchEndpoint"] = "legacy"
+        self.d.config["pageSize"] = "75"
+        captured = []
+        def fake_get(url, headers=None):
+            captured.append(url)
+            return {"issues": [], "total": 0, "startAt": 0}
+        with mock.patch.object(self.d, "_http_get", side_effect=fake_get):
+            self.d.fetch_all()
+        self.assertIn("maxResults=75", captured[0])
+
     def test_upsert_updates_existing_issue(self):
         put_calls = []
         def fake_put(url, body=None, headers=None):
@@ -1779,17 +1850,41 @@ class TestVikunjaDriver(unittest.TestCase):
         self.assertEqual(t["category"]["type"], "project")
 
     def test_fetch_all_paginates(self):
-        page1 = [{"id": i, "title": f"t{i}"} for i in range(50)]
+        # A full page (== PAGE_SIZE_DEFAULT) triggers a follow-up request;
+        # the short second page ends pagination.
+        full = grt.VikunjaDriver.PAGE_SIZE_DEFAULT
+        page1 = [{"id": i, "title": f"t{i}"} for i in range(full)]
         page2 = [{"id": 99, "title": "last"}]
         seq = [page1, page2]
         with mock.patch.object(self.d, "_http_get", side_effect=seq):
             tasks = self.d.fetch_all()
-        self.assertEqual(len(tasks), 51)
+        self.assertEqual(len(tasks), full + 1)
 
     def test_fetch_all_no_base_url_raises(self):
         d = grt.VikunjaDriver("v", "", {})
         with self.assertRaises(NotImplementedError):
             d.fetch_all()
+
+    def test_default_page_size_is_100(self):
+        # Bumped from 50 → 100 to halve round-trips on large projects.
+        self.assertEqual(grt.VikunjaDriver.PAGE_SIZE_DEFAULT, 100)
+        captured = []
+        def fake_get(url, headers=None):
+            captured.append(url)
+            return []
+        with mock.patch.object(self.d, "_http_get", side_effect=fake_get):
+            self.d.fetch_all()
+        self.assertIn("per_page=100", captured[0])
+
+    def test_page_size_override_from_config(self):
+        self.d.config["pageSize"] = "25"
+        captured = []
+        def fake_get(url, headers=None):
+            captured.append(url)
+            return []
+        with mock.patch.object(self.d, "_http_get", side_effect=fake_get):
+            self.d.fetch_all()
+        self.assertIn("per_page=25", captured[0])
 
     def test_fetch_all_dict_response(self):
         with mock.patch.object(self.d, "_http_get", return_value={"tasks": []}):

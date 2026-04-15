@@ -996,6 +996,28 @@ class Driver(ABC):
         except (TypeError, ValueError):
             return self.HTTP_TIMEOUT_DEFAULT
 
+    # Per-driver paginated-fetch batch size. Overridable per remote via
+    # `tasks-remote.<name>.pageSize`; each driver sets its own default
+    # close to what the service's API allows (Jira Cloud: 100, Vikunja: 100).
+    PAGE_SIZE_DEFAULT = 50
+    PAGE_SIZE_MAX = 1000
+
+    def _page_size(self) -> int:
+        raw = self.config.get("pageSize")
+        if raw in (None, ""):
+            return self.PAGE_SIZE_DEFAULT
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            return self.PAGE_SIZE_DEFAULT
+        # Clamp: services reject absurd page sizes with a 400 anyway, but
+        # clamping keeps the error local and actionable.
+        if val < 1:
+            return 1
+        if val > self.PAGE_SIZE_MAX:
+            return self.PAGE_SIZE_MAX
+        return val
+
     @staticmethod
     def _sleep_backoff(seconds: float) -> None:  # pragma: no cover - timing
         import time
@@ -1229,6 +1251,9 @@ class JiraPushError(RuntimeError):
 
 
 class JiraDriver(Driver):
+    # Jira Cloud caps /search/jql at 100 per request.
+    PAGE_SIZE_DEFAULT = 100
+    PAGE_SIZE_MAX = 100
     SCHEME = "jira"
 
     def _cross_source_error(self):
@@ -1358,11 +1383,12 @@ class JiraDriver(Driver):
             "summary,description,status,priority,created,updated,duedate,"
             "labels,project,customfield_10014"
         )
+        page_size = self._page_size()
         next_token: str | None = None
         while True:
             qs = (f"jql={urllib.parse.quote(jql)}"
                   f"&fields={urllib.parse.quote(fields)}"
-                  f"&maxResults=50")
+                  f"&maxResults={page_size}")
             if next_token:
                 qs += f"&nextPageToken={urllib.parse.quote(next_token)}"
             url = f"{base}/rest/api/3/search/jql?{qs}"
@@ -1382,7 +1408,7 @@ class JiraDriver(Driver):
     def _paginate_legacy(self, base: str, headers: dict, jql: str
                           ) -> list[dict]:
         start_at = 0
-        max_results = 50
+        max_results = self._page_size()
         issues: list[dict] = []
         while True:
             url = (
@@ -1543,6 +1569,10 @@ class VikunjaPushError(RuntimeError):
 
 
 class VikunjaDriver(Driver):
+    # Vikunja accepts up to 250 per page on typical deployments; 100 is a
+    # safe default that still halves round-trips vs the previous 50.
+    PAGE_SIZE_DEFAULT = 100
+    PAGE_SIZE_MAX = 250
     SCHEME = "vikunja"
 
     def _cross_source_error(self):
@@ -1620,7 +1650,7 @@ class VikunjaDriver(Driver):
             raise NotImplementedError("Vikunja baseUrl is not configured")
         headers = self._auth_header()
         page = 1
-        per_page = 50
+        per_page = self._page_size()
         tasks: list[dict] = []
         path = "/api/v1/tasks"
         while True:
