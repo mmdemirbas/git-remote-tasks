@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -959,6 +960,173 @@ class TestProtocolImport(unittest.TestCase):
                              stdin_text="import refs/heads/main\n\n")
             h.run()
         self.assertIn(f"from {sha}\n", h.stdout.getvalue())
+
+
+class IncrementalFakeDriver(FakeDriver):
+    """Stub driver that tracks fetch_changed calls and returns per-call deltas."""
+
+    def __init__(self, full=None, changed=None, deleted=None,
+                 new_since="2026-04-16T00:00:00Z"):
+        super().__init__(tasks=full or [])
+        self._changed = changed or []
+        self._deleted = deleted or []
+        self._new_since = new_since
+        self.fetch_changed_calls: list[str | None] = []
+
+    def fetch_changed(self, since):
+        self.fetch_changed_calls.append(since)
+        return list(self._changed), list(self._deleted), self._new_since
+
+
+class TestIncrementalImport(unittest.TestCase):
+    def _task(self, tid):
+        t = grt.empty_task()
+        t.update(id=tid, source="fake", title=tid,
+                 updated_date="2026-04-16T10:00:00Z")
+        return t
+
+    def _fake_git(self, rev_parse_sha=None, config_returncode=0):
+        """Return a subprocess.run stub that handles rev-parse + config."""
+        def run(cmd, *args, **kwargs):
+            if "rev-parse" in cmd:
+                if rev_parse_sha:
+                    return mock.Mock(returncode=0,
+                                      stdout=rev_parse_sha + "\n", stderr="")
+                return mock.Mock(returncode=1, stdout="", stderr="")
+            if "config" in cmd:
+                return mock.Mock(returncode=config_returncode, stdout="",
+                                  stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        return run
+
+    def test_incremental_mode_with_since_and_parent_emits_m_only(self):
+        driver = IncrementalFakeDriver(
+            changed=[self._task("fake-b")],
+            deleted=["fake-c"],
+        )
+        driver.config = {
+            "sync.mode": "incremental",
+            "sync.lastFetchAt": "2026-04-15T00:00:00Z",
+        }
+        sha = "b" * 40
+        with mock.patch.object(subprocess, "run",
+                                side_effect=self._fake_git(sha)):
+            h = make_handler(driver=driver,
+                             stdin_text="import refs/heads/main\n\n")
+            h.run()
+        out = h.stdout.getvalue()
+        self.assertIn("M 100644 :1 tasks/fake-b.yaml", out)
+        self.assertIn("D tasks/fake-c.yaml", out)
+        self.assertNotIn("deleteall", out)
+        self.assertIn(f"from {sha}", out)
+        self.assertEqual(driver.fetch_changed_calls,
+                          ["2026-04-15T00:00:00Z"])
+
+    def test_first_fetch_falls_back_to_full_snapshot(self):
+        # No lastFetchAt stored yet → must do a full fetch and set deleteall.
+        driver = IncrementalFakeDriver(full=[self._task("fake-a")])
+        driver.config = {"sync.mode": "incremental"}
+        with mock.patch.object(subprocess, "run",
+                                side_effect=self._fake_git(None)):
+            h = make_handler(driver=driver,
+                             stdin_text="import refs/heads/main\n\n")
+            h.run()
+        out = h.stdout.getvalue()
+        self.assertIn("deleteall", out)
+        self.assertEqual(driver.fetch_changed_calls, [],
+                          "fetch_changed must not run on first fetch")
+
+    def test_full_mode_always_full_snapshot(self):
+        driver = IncrementalFakeDriver(full=[self._task("fake-a")])
+        driver.config = {
+            "sync.mode": "full",
+            "sync.lastFetchAt": "2026-04-15T00:00:00Z",
+        }
+        sha = "c" * 40
+        with mock.patch.object(subprocess, "run",
+                                side_effect=self._fake_git(sha)):
+            h = make_handler(driver=driver,
+                             stdin_text="import refs/heads/main\n\n")
+            h.run()
+        out = h.stdout.getvalue()
+        self.assertIn("deleteall", out)
+        self.assertEqual(driver.fetch_changed_calls, [])
+
+
+class TestDriverFetchChangedDefault(unittest.TestCase):
+    def test_base_impl_delegates_to_fetch_all(self):
+        class D(grt.Driver):
+            SCHEME = "x"
+            def fetch_all(self):
+                return [{"id": "x-1"}]
+        changed, deleted, since = D("r", "u", {}).fetch_changed(None)
+        self.assertEqual([t["id"] for t in changed], ["x-1"])
+        self.assertEqual(deleted, [])
+        self.assertTrue(since)
+
+
+class TestJiraIncremental(unittest.TestCase):
+    def setUp(self):
+        self.d = grt.JiraDriver("jira", "https://x",
+                                 {"baseUrl": "https://x", "email": "a",
+                                  "apiToken": "t"})
+
+    def test_fetch_changed_with_since_uses_jql_updated_clause(self):
+        calls = []
+        def fake_get(url, headers=None):
+            calls.append(url)
+            return {"issues": [], "total": 0}
+        with mock.patch.object(self.d, "_http_get", side_effect=fake_get):
+            self.d.fetch_changed("2026-04-15T00:00:00Z")
+        self.assertTrue(calls, "should hit the API")
+        joined = calls[0]
+        self.assertIn("updated%20%3E%3D", joined)  # quoted 'updated >='
+        self.assertIn("2026-04-15", joined)
+
+    def test_fetch_changed_without_since_pages_everything(self):
+        with mock.patch.object(self.d, "_http_get",
+                                return_value={"issues": [], "total": 0}):
+            changed, deleted, since = self.d.fetch_changed(None)
+        self.assertEqual(changed, [])
+        self.assertEqual(deleted, [])
+        self.assertTrue(since)
+
+
+class TestVikunjaIncremental(unittest.TestCase):
+    def setUp(self):
+        self.d = grt.VikunjaDriver("vikunja", "http://x",
+                                     {"baseUrl": "http://x", "apiToken": "t"})
+
+    def test_fetch_changed_with_since_adds_filter(self):
+        calls = []
+        def fake_get(url, headers=None):
+            calls.append(url)
+            return []
+        with mock.patch.object(self.d, "_http_get", side_effect=fake_get):
+            self.d.fetch_changed("2026-04-15T00:00:00Z")
+        self.assertTrue(calls)
+        self.assertIn("filter=", calls[0])
+        self.assertIn("updated", urllib.parse.unquote(calls[0]))
+
+
+class TestWriteConfigValue(unittest.TestCase):
+    def test_success(self):
+        with mock.patch.object(subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            self.assertTrue(grt.write_config_value("k", "v"))
+
+    def test_failure(self):
+        with mock.patch.object(subprocess, "run") as run, \
+                mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            run.return_value = mock.Mock(returncode=1, stdout="", stderr="nope")
+            self.assertFalse(grt.write_config_value("k", "v"))
+        self.assertIn("nope", err.getvalue())
+
+    def test_git_missing(self):
+        with mock.patch.object(subprocess, "run",
+                                side_effect=FileNotFoundError("x")), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            self.assertFalse(grt.write_config_value("k", "v"))
 
 
 class TestProtocolExport(unittest.TestCase):

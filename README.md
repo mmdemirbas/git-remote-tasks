@@ -146,6 +146,31 @@ Per-remote (`tasks-remote.<name>.*`):
 Run `python git_remote_tasks.py check <remote>` to validate required keys
 without touching the network. Secret-like keys are redacted in its output.
 
+### 7.1 Incremental sync state
+
+After a successful fetch, the helper writes a token to `.git/config` so
+the next run can ask the service only for what changed:
+
+| Key                                     | Who sets it | Meaning                                                      |
+|-----------------------------------------|-------------|--------------------------------------------------------------|
+| `tasks-remote.<name>.sync.mode`         | user        | `incremental` (default) or `full`. `full` forces a deleteall snapshot. |
+| `tasks-remote.<name>.sync.lastFetchAt`  | helper      | ISO timestamp token passed back as `since` on the next fetch. |
+
+- **Jira** uses `updated >= "<ts>"` in the JQL filter.
+- **Vikunja** uses `filter=updated > '<ts>'`.
+- **MS Todo** and **Notion** currently fall back to a full fetch on
+  every run; per-service incremental APIs land with their write paths.
+
+Neither Jira nor Vikunja exposes a native deletion feed, so tasks
+removed upstream are only garbage-collected on a full fetch. Set
+`sync.mode=full` periodically (or before releases) to reconcile:
+
+```bash
+git config tasks-remote.jira-work.sync.mode full
+git fetch jira-work
+git config tasks-remote.jira-work.sync.mode incremental
+```
+
 ## 8. Service setup
 
 ### Jira (Atlassian Cloud)

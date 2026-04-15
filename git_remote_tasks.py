@@ -670,6 +670,24 @@ def read_remote_config(remote_name: str) -> dict:
     return config
 
 
+def write_config_value(key: str, value: str) -> bool:
+    """Write a single key/value to the local git config. Returns True on success."""
+    try:
+        proc = subprocess.run(
+            ["git", "config", "--local", key, value],
+            capture_output=True, text=True, check=False,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        print(f"git-remote-tasks: git config write failed: {exc}", file=sys.stderr)
+        return False
+    if proc.returncode != 0:
+        if proc.stderr.strip():
+            print(f"git-remote-tasks: git config: {proc.stderr.strip()}",
+                  file=sys.stderr)
+        return False
+    return True
+
+
 # ============================================================================
 # Driver base + service drivers
 # ============================================================================
@@ -709,6 +727,31 @@ class Driver(ABC):
     def fetch_all(self) -> list[dict]:
         """Fetch all tasks from the remote service as unified task dicts."""
         raise NotImplementedError
+
+    def fetch_changed(
+        self, since: str | None
+    ) -> tuple[list[dict], list[str], str | None]:
+        """Return (changed_tasks, deleted_ids, new_since_token).
+
+        `since` is an opaque per-driver state token previously returned by this
+        method — typically an ISO timestamp, but for MS Todo it will be a
+        Graph delta link. Pass `None` to request a full snapshot.
+
+        Returns a tuple:
+          - changed_tasks: tasks to M into the tree.
+          - deleted_ids: task ids to D from the tree (only services with
+            native deletion signals populate this; the rest return []).
+          - new_since_token: the token to persist for the next run.
+
+        Base implementation delegates to fetch_all() — every subclass is
+        free to override to hit a narrower API.
+        """
+        tasks = self.fetch_all()
+        return tasks, [], self._now_iso()
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def upsert(self, task: dict) -> None:
         """Create or update the task on the remote service."""
@@ -825,6 +868,28 @@ class JiraDriver(Driver):
         return t
 
     def fetch_all(self) -> list[dict]:
+        return self._paginate(jql="ORDER BY updated DESC")
+
+    def fetch_changed(
+        self, since: str | None
+    ) -> tuple[list[dict], list[str], str | None]:
+        """Incremental fetch via JQL `updated >= "<iso>"`.
+
+        Jira has no native deletion feed, so deleted_ids is always [].
+        Operators who need to GC removed issues should run a periodic
+        full fetch (`git config tasks-remote.<name>.sync.mode full`).
+        """
+        if since is None:
+            issues = self._paginate(jql="ORDER BY updated ASC")
+        else:
+            # JQL wants a 'yyyy-MM-dd HH:mm' literal, not ISO with T / Z.
+            jira_ts = since.replace("T", " ").replace("Z", "").split(".")[0]
+            jql = f'updated >= "{jira_ts}" ORDER BY updated ASC'
+            issues = self._paginate(jql=jql)
+        tasks = [self.normalize(x) for x in issues]
+        return tasks, [], self._now_iso()
+
+    def _paginate(self, jql: str) -> list[dict]:
         base = self.config.get("baseUrl") or self.url
         if not base:
             raise NotImplementedError("Jira baseUrl is not configured")
@@ -835,7 +900,7 @@ class JiraDriver(Driver):
         while True:
             url = (
                 f"{base.rstrip('/')}/rest/api/3/search"
-                f"?jql={urllib.parse.quote('ORDER BY updated DESC')}"
+                f"?jql={urllib.parse.quote(jql)}"
                 f"&startAt={start_at}&maxResults={max_results}"
             )
             data = self._http_get(url, headers=headers)
@@ -845,7 +910,7 @@ class JiraDriver(Driver):
             start_at += len(page)
             if not page or start_at >= total:
                 break
-        return [self.normalize(x) for x in issues]
+        return issues
 
 
 # ---------- Vikunja ---------------------------------------------------------
@@ -887,6 +952,26 @@ class VikunjaDriver(Driver):
         return t
 
     def fetch_all(self) -> list[dict]:
+        return [self.normalize(x) for x in self._paginate(filter_expr=None)]
+
+    def fetch_changed(
+        self, since: str | None
+    ) -> tuple[list[dict], list[str], str | None]:
+        """Incremental fetch via Vikunja's `filter=updated > '<iso>'`.
+
+        Like Jira, Vikunja has no native deletion feed — operators who
+        care about upstream deletions should alternate with a full fetch.
+        """
+        filter_expr = None
+        if since is not None:
+            # Vikunja's filter syntax accepts ISO strings quoted as string
+            # literals; it tolerates the trailing Z.
+            filter_expr = f"updated > '{since}'"
+        rows = self._paginate(filter_expr=filter_expr)
+        tasks = [self.normalize(x) for x in rows]
+        return tasks, [], self._now_iso()
+
+    def _paginate(self, filter_expr: str | None) -> list[dict]:
         base = self.config.get("baseUrl") or self.url
         if not base:
             raise NotImplementedError("Vikunja baseUrl is not configured")
@@ -895,7 +980,10 @@ class VikunjaDriver(Driver):
         per_page = 50
         tasks: list[dict] = []
         while True:
-            url = f"{base.rstrip('/')}/api/v1/tasks/all?page={page}&per_page={per_page}"
+            query = f"page={page}&per_page={per_page}&sort_by=updated&order_by=desc"
+            if filter_expr is not None:
+                query += "&filter=" + urllib.parse.quote(filter_expr)
+            url = f"{base.rstrip('/')}/api/v1/tasks/all?{query}"
             data = self._http_get(url, headers=headers)
             if not isinstance(data, list):
                 data = data.get("tasks", []) if isinstance(data, dict) else []
@@ -903,7 +991,7 @@ class VikunjaDriver(Driver):
             if len(data) < per_page:
                 break
             page += 1
-        return [self.normalize(x) for x in tasks]
+        return tasks
 
 
 # ---------- MS Todo ---------------------------------------------------------
@@ -1172,12 +1260,80 @@ class ProtocolHandler:
             nxt = self.stdin.readline()
             if not nxt or nxt.strip() == "":
                 break
-        tasks = self.driver.fetch_all()
-        tasks_sorted = sorted(tasks, key=lambda t: t.get("id") or "")
-        self._write_fast_import(tasks_sorted)
 
-    def _write_fast_import(self, tasks: list[dict]) -> None:
+        mode = (self.driver.config.get("sync.mode") or "incremental").lower()
+        since = self.driver.config.get("sync.lastFetchAt")
+        parent = self._previous_tip()
+
+        # Incremental mode requires both: a persisted `since` token AND an
+        # existing remote tip to base the next commit on. Without a parent
+        # commit, a diff-only import produces an empty tree. Fall back to a
+        # full snapshot in that case so the first fetch still works.
+        if mode == "full" or since is None or parent is None:
+            tasks = self.driver.fetch_all()
+            tasks_sorted = sorted(tasks, key=lambda t: t.get("id") or "")
+            self._write_fast_import(tasks_sorted, parent=parent)
+            self._persist_since(self.driver._now_iso())
+            return
+
+        changed, deleted_ids, new_since = self.driver.fetch_changed(since)
+        changed_sorted = sorted(changed, key=lambda t: t.get("id") or "")
+        self._write_incremental_import(changed_sorted, deleted_ids,
+                                        parent=parent)
+        if new_since:
+            self._persist_since(new_since)
+
+    def _persist_since(self, value: str) -> None:
+        """Store the new `sync.lastFetchAt` token in .git/config.
+
+        Best-effort: failure to write just means the next run falls back to
+        a full snapshot, which is correct but expensive. We warn so
+        operators can fix the underlying git-config issue.
+        """
+        key = f"tasks-remote.{self.remote_name}.sync.lastFetchAt"
+        if not write_config_value(key, value):
+            self._warn_once(
+                "sync-persist",
+                f"failed to persist {key}; next fetch will do a full snapshot.",
+            )
+
+    def _write_fast_import(self, tasks: list[dict],
+                           parent: str | None = None) -> None:
+        """Full-snapshot import: deleteall + every blob."""
+        if parent is None:
+            parent = self._previous_tip()
         ext = self.serializer.EXTENSION
+        blobs = self._emit_blobs(tasks, ext)
+        commit_mark = len(blobs) + 1
+        self._emit_commit_header(commit_mark, tasks, parent)
+        self._write("deleteall\n")
+        for mark, _body, path in blobs:
+            self._write(f"M 100644 :{mark} {path}\n")
+        self._write("\n")
+        self._write("done\n")
+
+    def _write_incremental_import(self, changed: list[dict],
+                                   deleted_ids: list[str],
+                                   parent: str) -> None:
+        """Diff-only import: M for changed tasks, D for deleted, no deleteall.
+
+        Requires a parent commit to base the tree on — the caller guarantees
+        this. With no parent, a diff-only import yields an empty tree.
+        """
+        ext = self.serializer.EXTENSION
+        blobs = self._emit_blobs(changed, ext)
+        commit_mark = len(blobs) + 1
+        self._emit_commit_header(commit_mark, changed, parent,
+                                  summary="update")
+        for mark, _body, path in blobs:
+            self._write(f"M 100644 :{mark} {path}\n")
+        for tid in deleted_ids:
+            self._write(f"D tasks/{tid}.{ext}\n")
+        self._write("\n")
+        self._write("done\n")
+
+    def _emit_blobs(self, tasks: list[dict], ext: str
+                    ) -> list[tuple[int, bytes, str]]:
         blobs: list[tuple[int, bytes, str]] = []
         for idx, task in enumerate(tasks, start=1):
             body = self.serializer.serialize(task).encode("utf-8")
@@ -1187,7 +1343,6 @@ class ProtocolHandler:
             self._write("blob\n")
             self._write(f"mark :{mark}\n")
             self._write(f"data {len(body)}\n")
-            # Raw bytes - write through underlying buffer when available.
             buf = getattr(self.stdout, "buffer", None)
             if buf is not None:
                 self.stdout.flush()
@@ -1197,11 +1352,15 @@ class ProtocolHandler:
             else:
                 self._write(body.decode("utf-8"))
                 self._write("\n")
-        commit_mark = len(blobs) + 1
+        return blobs
+
+    def _emit_commit_header(self, commit_mark: int, tasks: list[dict],
+                             parent: str | None,
+                             summary: str = "import") -> None:
         latest = self._latest_updated(tasks)
         ts = int(latest.timestamp())
         message = (
-            f"tasks: import {self.remote_name} ({len(tasks)} tasks) "
+            f"tasks: {summary} {self.remote_name} ({len(tasks)} tasks) "
             f"[{latest.strftime('%Y-%m-%dT%H:%M:%SZ')}]"
         )
         mbytes = message.encode("utf-8")
@@ -1210,14 +1369,8 @@ class ProtocolHandler:
         self._write(f"committer git-remote-tasks <tasks@local> {ts} +0000\n")
         self._write(f"data {len(mbytes)}\n")
         self._write(message + "\n")
-        parent = self._previous_tip()
         if parent:
             self._write(f"from {parent}\n")
-        self._write("deleteall\n")
-        for mark, _body, path in blobs:
-            self._write(f"M 100644 :{mark} {path}\n")
-        self._write("\n")
-        self._write("done\n")
 
     def _previous_tip(self) -> str | None:
         """Return the sha of refs/remotes/<remote>/main if it exists, else None.
