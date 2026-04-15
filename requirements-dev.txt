@@ -1,0 +1,11 @@
+# Test-time dependencies only — NEVER imported from git_remote_tasks.py.
+# The shipped script must stay single-file and stdlib-only so that a symlink
+# install works on any machine with Python 3.10+. Anything here must be
+# opt-in: installed into .venv from this file, not into the host Python.
+#
+# Install:
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements-dev.txt
+#   .venv/bin/python -m unittest test_git_remote_tasks
+
+hypothesis>=6.100

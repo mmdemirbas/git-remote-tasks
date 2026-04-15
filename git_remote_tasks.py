@@ -174,6 +174,44 @@ def _parse_yaml_inline_scalar(raw: str):
 
 
 class YAMLSerializer(Serializer):
+    """Hand-written YAML emitter + parser, supporting a documented subset only.
+
+    Supported on output (what this class emits):
+      - Top-level scalar keys: `id`, `source`, `title`, `description`,
+        `status`, `priority`, `created_date`, `due_date`, `updated_date`,
+        `url`, plus the nested `category` mapping and the `tags` / `logbook`
+        sequences.
+      - Quoted double-quoted strings with `\\\\`, `\\"`, and `\\n` escapes.
+      - Block scalars (`|`) for multi-line fields such as `description`.
+      - Always-quoted date strings, `null` for None, `[]` for empty lists.
+
+    Supported on input (what the parser tolerates from a hand edit):
+      - All of the above, plus single-quoted strings with the `''`
+        escape and unquoted scalars when `_yaml_needs_quoting` says it
+        is safe.
+      - Line comments (`#`), blank lines.
+
+    Explicitly NOT supported — files using these features will be
+    misparsed or silently truncated:
+      - Anchors / aliases (`&anchor` / `*alias`).
+      - Flow collections beyond the bare `[]` empty list.
+      - Tagged types (`!!str`, `!!int`, explicit YAML tags).
+      - Multi-document streams (`---` / `...`).
+      - Nested mappings deeper than one level below the top key.
+      - Keys containing characters outside `[A-Za-z_][A-Za-z0-9_]*`.
+      - CRLF line endings (strip before passing in).
+      - Explicit block-scalar chomping indicators (`|-`, `|+`). The
+        emitter only writes `|` (clip-with-strip) — trailing `\\n` in
+        a value is normalized away on round-trip. Upstream services
+        do not emit trailing newlines in description-like fields so
+        this never surfaces in practice.
+
+    The round-trip invariant, exercised by the hypothesis fuzz suite in
+    `test_yaml_parser_fuzz.py`, is:
+
+        normalize_task(deserialize(serialize(t))) == normalize_task(t)
+    """
+
     EXTENSION = "yaml"
 
     def serialize(self, task: dict) -> str:
