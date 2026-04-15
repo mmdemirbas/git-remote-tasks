@@ -750,6 +750,113 @@ class TestMSTodoDriver(unittest.TestCase):
             with self.assertRaises(NotImplementedError):
                 d.fetch_all()
 
+    def test_upsert_update_existing_uses_category_id_as_list(self):
+        patches = []
+        def fake_patch(url, body=None, headers=None):
+            patches.append((url, body))
+            return {}
+        task = full_task(id="msftodo-T1", source="msftodo",
+                         category={"id": "L-abc", "name": "Inbox", "type": "list"},
+                         title="hello", status="in_progress")
+        with mock.patch.object(self.d, "_http_patch", side_effect=fake_patch):
+            self.d.upsert(task)
+        url, body = patches[0]
+        self.assertIn("/me/todo/lists/L-abc/tasks/T1", url)
+        self.assertEqual(body["status"], "inProgress")
+        self.assertEqual(body["title"], "hello")
+
+    def test_upsert_create_uses_default_list_when_id_empty(self):
+        self.d.config["defaultListId"] = "L-fallback"
+        posts = []
+        def fake_post(url, body=None, headers=None):
+            posts.append(url)
+            return {}
+        task = full_task(id="msftodo-", category={"id": None, "name": None,
+                                                   "type": "other"})
+        with mock.patch.object(self.d, "_http_post", side_effect=fake_post):
+            self.d.upsert(task)
+        self.assertIn("/me/todo/lists/L-fallback/tasks", posts[0])
+
+    def test_upsert_refuses_when_list_id_unresolvable(self):
+        task = full_task(id="", category={"id": None, "name": None,
+                                           "type": "other"})
+        with self.assertRaises(grt.MSTodoPushError):
+            self.d.upsert(task)
+
+    def test_delete_requires_default_list_id(self):
+        with self.assertRaises(grt.MSTodoPushError):
+            self.d.delete("msftodo-T1")
+        self.d.config["defaultListId"] = "L-x"
+        with mock.patch.object(self.d, "_http_delete") as hd:
+            self.d.delete("msftodo-T1")
+        self.assertTrue(hd.call_args[0][0].endswith("/me/todo/lists/L-x/tasks/T1"))
+
+    def test_delete_refuses_cross_source(self):
+        self.d.config["defaultListId"] = "L-x"
+        with self.assertRaises(grt.MSTodoPushError):
+            self.d.delete("jira-PROJ-1")
+
+
+class TestMSTodoAuth(unittest.TestCase):
+    def setUp(self):
+        self.d = grt.MSTodoDriver("msftodo", "msftodo://consumers", {})
+
+    def test_access_token_short_circuits(self):
+        self.d.config["accessToken"] = "tok"
+        self.assertEqual(self.d._acquire_token(), "tok")
+
+    def test_no_msal_no_access_token_raises(self):
+        with mock.patch.object(grt, "MSAL_AVAILABLE", False):
+            with self.assertRaises(NotImplementedError):
+                self.d._acquire_token()
+
+    def test_msal_requires_client_id(self):
+        self.d.config = {}  # no clientId
+        with mock.patch.object(grt, "MSAL_AVAILABLE", True):
+            with self.assertRaises(NotImplementedError):
+                self.d._acquire_token()
+
+    def test_refresh_token_is_used_silently(self):
+        self.d.config = {"clientId": "cid", "refreshToken": "rt"}
+        fake_app = mock.Mock()
+        fake_app.acquire_token_by_refresh_token.return_value = {
+            "access_token": "new-tok", "refresh_token": "rt2",
+        }
+        fake_msal = mock.Mock()
+        fake_msal.PublicClientApplication.return_value = fake_app
+        with mock.patch.object(grt, "MSAL_AVAILABLE", True), \
+                mock.patch.object(grt, "msal", fake_msal, create=True), \
+                mock.patch.object(grt, "write_config_value",
+                                   return_value=True) as w:
+            tok = self.d._acquire_token()
+        self.assertEqual(tok, "new-tok")
+        # The new refresh token is persisted.
+        w.assert_called_once()
+        self.assertIn("refreshToken", w.call_args[0][0])
+
+    def test_device_flow_prints_prompt_and_returns_token(self):
+        self.d.config = {"clientId": "cid"}
+        fake_app = mock.Mock()
+        fake_app.initiate_device_flow.return_value = {
+            "user_code": "ABC123",
+            "verification_uri": "https://example.com/device",
+            "message": "Visit https://example.com/device and enter ABC123",
+        }
+        fake_app.acquire_token_by_device_flow.return_value = {
+            "access_token": "tok", "refresh_token": "rt",
+        }
+        fake_msal = mock.Mock()
+        fake_msal.PublicClientApplication.return_value = fake_app
+        err = io.StringIO()
+        with mock.patch.object(grt, "MSAL_AVAILABLE", True), \
+                mock.patch.object(grt, "msal", fake_msal, create=True), \
+                mock.patch.object(grt, "write_config_value",
+                                   return_value=True), \
+                mock.patch.object(sys, "stderr", err):
+            tok = self.d._acquire_token()
+        self.assertEqual(tok, "tok")
+        self.assertIn("ABC123", err.getvalue())
+
 
 # ---------------------------------------------------------------------------
 # Driver normalization - Notion

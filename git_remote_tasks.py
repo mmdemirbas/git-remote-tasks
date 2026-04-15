@@ -1218,10 +1218,73 @@ _MSTODO_PRIORITY_MAP = {"high": "high", "normal": "medium", "low": "low"}
 class MSTodoDriver(Driver):
     SCHEME = "msftodo"
 
+    _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+    _MSAL_SCOPES = ("Tasks.ReadWrite",)
+
     def _auth_header(self) -> dict:
-        # Real implementation would acquire a bearer via MSAL device code flow.
-        token = self.config.get("accessToken", "")
+        token = self._acquire_token()
         return {"Authorization": f"Bearer {token}"}
+
+    def _acquire_token(self) -> str:
+        """Return a live Graph bearer.
+
+        Priority:
+          1. `accessToken` in config — pre-provisioned bearer, unchanged.
+          2. `refreshToken` in config + MSAL installed — silent refresh.
+          3. MSAL installed + `clientId` / `tenantId` — device code flow,
+             prompting the user on stderr. Persists the refresh token on
+             success so subsequent runs path 2.
+
+        Without any of these, raise NotImplementedError with a clear hint.
+        """
+        token = self.config.get("accessToken")
+        if token:
+            return token
+        if not MSAL_AVAILABLE:
+            raise NotImplementedError(
+                "MS Todo auth requires either accessToken in git config or the "
+                "optional msal package (pip install msal) plus clientId/tenantId."
+            )
+        client_id = self.config.get("clientId")
+        tenant_id = self.config.get("tenantId") or "consumers"
+        if not client_id:
+            raise NotImplementedError(
+                "MS Todo auth needs tasks-remote.<name>.clientId "
+                "(Azure AD app registration)."
+            )
+        app = msal.PublicClientApplication(
+            client_id=client_id,
+            authority=f"https://login.microsoftonline.com/{tenant_id}",
+        )
+        scopes = list(self._MSAL_SCOPES)
+        refresh = self.config.get("refreshToken")
+        if refresh:
+            result = app.acquire_token_by_refresh_token(refresh, scopes=scopes)
+            if result and "access_token" in result:
+                self._store_refresh(result.get("refresh_token") or refresh)
+                return result["access_token"]
+        # Device-code fall-through. Prompt on stderr so the user sees it
+        # whether this runs under `git fetch` (stderr is TTY) or directly.
+        flow = app.initiate_device_flow(scopes=scopes)
+        if "user_code" not in flow:
+            raise NotImplementedError(
+                f"MSAL device flow init failed: {flow!r}"
+            )
+        print(flow.get("message") or
+              f"Visit {flow.get('verification_uri')} and enter {flow['user_code']}",
+              file=sys.stderr, flush=True)
+        result = app.acquire_token_by_device_flow(flow)
+        if "access_token" not in result:
+            raise NotImplementedError(
+                f"MSAL device flow failed: {result.get('error_description') or result}"
+            )
+        if result.get("refresh_token"):
+            self._store_refresh(result["refresh_token"])
+        return result["access_token"]
+
+    def _store_refresh(self, refresh_token: str) -> None:
+        key = f"tasks-remote.{self.remote_name}.refreshToken"
+        write_config_value(key, refresh_token)
 
     def normalize(self, task: dict, list_name: str | None = None) -> dict:
         t = empty_task()
@@ -1258,18 +1321,105 @@ class MSTodoDriver(Driver):
                 "MS Todo requires MSAL device-code auth or a preconfigured accessToken"
             )
         headers = self._auth_header()
-        lists_url = "https://graph.microsoft.com/v1.0/me/todo/lists"
+        lists_url = f"{self._GRAPH_BASE}/me/todo/lists"
         lists = self._http_get(lists_url, headers=headers).get("value", [])
         out: list[dict] = []
         for lst in lists:
             lid = lst.get("id")
             lname = lst.get("displayName")
             tasks = self._http_get(
-                f"https://graph.microsoft.com/v1.0/me/todo/lists/{lid}/tasks",
+                f"{self._GRAPH_BASE}/me/todo/lists/{lid}/tasks",
                 headers=headers,
             ).get("value", [])
             out.extend(self.normalize(t, list_name=lname) for t in tasks)
         return out
+
+    # ---- Push ----
+    _STATUS_TO_MSTODO = {
+        "todo": "notStarted", "in_progress": "inProgress",
+        "done": "completed", "cancelled": "notStarted",  # no cancelled state
+    }
+    _PRIORITY_TO_MSTODO = {
+        "critical": "high", "high": "high", "medium": "normal",
+        "low": "low", "none": "normal",
+    }
+
+    def _list_id_for(self, task: dict) -> str | None:
+        """Resolve the parent list id for an upsert.
+
+        Prefer the task's category.id (populated on pull). Fall back to the
+        per-remote defaultListId. Returning None means caller must refuse.
+        """
+        cat = task.get("category") or {}
+        return cat.get("id") or self.config.get("defaultListId")
+
+    def _serialize_for_push(self, task: dict) -> dict:
+        payload: dict = {
+            "title": task.get("title") or "",
+            "status": self._STATUS_TO_MSTODO.get(
+                task.get("status") or "todo", "notStarted"),
+            "importance": self._PRIORITY_TO_MSTODO.get(
+                task.get("priority") or "none", "normal"),
+        }
+        desc = task.get("description")
+        if desc:
+            payload["body"] = {"content": desc, "contentType": "text"}
+        if task.get("due_date"):
+            payload["dueDateTime"] = {
+                "dateTime": (task["due_date"] if "T" in task["due_date"]
+                             else f"{task['due_date']}T00:00:00"),
+                "timeZone": "UTC",
+            }
+        if task.get("tags"):
+            payload["categories"] = list(task["tags"])
+        return payload
+
+    def upsert(self, task: dict) -> None:
+        list_id = self._list_id_for(task)
+        if not list_id:
+            raise MSTodoPushError(
+                "cannot resolve MS Todo list id; pull first so category.id "
+                "is populated or set tasks-remote.<name>.defaultListId"
+            )
+        headers = self._auth_header()
+        native = self._native_id(task.get("id") or "")
+        payload = self._serialize_for_push(task)
+        lid = urllib.parse.quote(list_id, safe="")
+        if native:
+            tid = urllib.parse.quote(native, safe="")
+            self._http_patch(
+                f"{self._GRAPH_BASE}/me/todo/lists/{lid}/tasks/{tid}",
+                body=payload, headers=headers,
+            )
+            return
+        self._http_post(
+            f"{self._GRAPH_BASE}/me/todo/lists/{lid}/tasks",
+            body=payload, headers=headers,
+        )
+
+    def delete(self, task_id: str) -> None:
+        native = self._native_id(task_id)
+        if not native:
+            raise MSTodoPushError(
+                f"cannot delete {task_id!r}: not a MS Todo-sourced id"
+            )
+        list_id = self.config.get("defaultListId")
+        if not list_id:
+            raise MSTodoPushError(
+                "MS Todo delete needs tasks-remote.<name>.defaultListId "
+                "because the removed task file no longer carries the list id"
+            )
+        headers = self._auth_header()
+        lid = urllib.parse.quote(list_id, safe="")
+        tid = urllib.parse.quote(native, safe="")
+        self._http_delete(
+            f"{self._GRAPH_BASE}/me/todo/lists/{lid}/tasks/{tid}",
+            headers=headers,
+        )
+
+
+class MSTodoPushError(RuntimeError):
+    """Raised when a push is rejected before or by MS Todo."""
 
 
 # ---------- Notion ----------------------------------------------------------
