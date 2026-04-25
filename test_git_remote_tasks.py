@@ -16,7 +16,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 import urllib.parse
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -4094,6 +4096,98 @@ class TestR11IdempotentDelete(unittest.TestCase):
             "databaseId": "abc", "token": "t",
         })
         self._check_500_still_raises(d, "notion-pageid")
+
+
+# ============================================================================
+# R-13: incremental fetch overlap window
+# ============================================================================
+
+class TestR13SinceOverlap(unittest.TestCase):
+    def test_default_overlap_is_in_the_past_of_now(self):
+        d = grt.JiraDriver("jira", "https://x", {
+            "baseUrl": "https://x", "email": "a@b", "apiToken": "t",
+        })
+        before = d._now_iso()
+        token = d._since_with_overlap()
+        after = d._now_iso()
+        # token should be ≤ before (overlap subtracts time).
+        self.assertLessEqual(token, before)
+        # And not so far in the past that it's outside a sane bound.
+        # 60s is a generous upper bound on the default of 5s.
+        delta = (datetime.fromisoformat(after.replace("Z", "+00:00"))
+                  - datetime.fromisoformat(token.replace("Z", "+00:00")))
+        self.assertLessEqual(delta.total_seconds(), 60)
+
+    def test_overlap_disabled_when_zero_or_negative(self):
+        d = grt.JiraDriver("jira", "https://x", {
+            "baseUrl": "https://x", "email": "a@b", "apiToken": "t",
+            "syncOverlapSeconds": "0",
+        })
+        # With overlap=0, token equals _now_iso() (same second).
+        before = d._now_iso()
+        token = d._since_with_overlap()
+        # tokens are second-precision and the call sequence is sub-second,
+        # so they should match.
+        self.assertEqual(token, before)
+
+    def test_overlap_configurable(self):
+        d = grt.JiraDriver("jira", "https://x", {
+            "baseUrl": "https://x", "email": "a@b", "apiToken": "t",
+            "syncOverlapSeconds": "30",
+        })
+        now = d._now_iso()
+        token = d._since_with_overlap()
+        delta = (datetime.fromisoformat(now.replace("Z", "+00:00"))
+                  - datetime.fromisoformat(token.replace("Z", "+00:00")))
+        self.assertGreaterEqual(delta.total_seconds(), 29)
+        self.assertLessEqual(delta.total_seconds(), 31)
+
+    def test_overlap_invalid_falls_back_to_default(self):
+        d = grt.JiraDriver("jira", "https://x", {
+            "baseUrl": "https://x", "email": "a@b", "apiToken": "t",
+            "syncOverlapSeconds": "abc",
+        })
+        # Should not raise; uses default.
+        token = d._since_with_overlap()
+        self.assertTrue(token.endswith("Z"))
+
+    def test_jira_fetch_changed_uses_overlap(self):
+        d = grt.JiraDriver("jira", "https://x", {
+            "baseUrl": "https://x", "email": "a@b", "apiToken": "t",
+            "syncOverlapSeconds": "10",
+        })
+        with mock.patch.object(d, "_paginate", return_value=[]):
+            _, _, token = d.fetch_changed("2024-01-01T00:00:00Z")
+        now = d._now_iso()
+        delta = (datetime.fromisoformat(now.replace("Z", "+00:00"))
+                  - datetime.fromisoformat(token.replace("Z", "+00:00")))
+        self.assertGreaterEqual(delta.total_seconds(), 9)
+
+    def test_vikunja_fetch_changed_uses_overlap(self):
+        d = grt.VikunjaDriver("vikunja", "vikunja://x", {
+            "baseUrl": "http://localhost:3456", "apiToken": "t",
+            "syncOverlapSeconds": "10",
+        })
+        with mock.patch.object(d, "_paginate", return_value=[]):
+            _, _, token = d.fetch_changed("2024-01-01T00:00:00Z")
+        now = d._now_iso()
+        delta = (datetime.fromisoformat(now.replace("Z", "+00:00"))
+                  - datetime.fromisoformat(token.replace("Z", "+00:00")))
+        self.assertGreaterEqual(delta.total_seconds(), 9)
+
+    def test_notion_fetch_changed_uses_overlap(self):
+        class FakeNotion(grt.NotionDriver):
+            def _http_post(self, url, body=None, headers=None):
+                return {"results": [], "has_more": False}
+        d = FakeNotion("notion", "notion://x", {
+            "databaseId": "abc", "token": "t",
+            "syncOverlapSeconds": "10",
+        })
+        _, _, token = d.fetch_changed("2024-01-01T00:00:00Z")
+        now = d._now_iso()
+        delta = (datetime.fromisoformat(now.replace("Z", "+00:00"))
+                  - datetime.fromisoformat(token.replace("Z", "+00:00")))
+        self.assertGreaterEqual(delta.total_seconds(), 9)
 
 
 class TestR08DeletedIdsSafetyCheck(unittest.TestCase):

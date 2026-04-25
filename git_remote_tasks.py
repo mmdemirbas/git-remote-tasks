@@ -1178,6 +1178,38 @@ class Driver(ABC):
     def _now_iso() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    # Default overlap window applied by `_since_with_overlap`. Five seconds
+    # is enough to absorb the gap between a server-side write landing and
+    # our wall-clock read; the cost is re-fetching a handful of recent
+    # tasks on every incremental call.
+    _SYNC_OVERLAP_DEFAULT = 5.0
+
+    def _since_with_overlap(self) -> str:
+        """Return an ISO timestamp suitable for the next `since` token.
+
+        Uses `now - overlap_seconds` so events that landed upstream during
+        our fetch (and therefore have `updated_date < _now_iso()`) are not
+        missed on the following run. Without this, a busy project can drop
+        rows that updated mid-fetch — they have a timestamp earlier than
+        the token we'd otherwise persist. (R-13)
+
+        Overlap is configurable via `tasks-remote.<name>.syncOverlapSeconds`;
+        non-positive values disable the window (matching the historical
+        behaviour). Driver subclasses use this in `fetch_changed`.
+        """
+        raw = self.config.get("syncOverlapSeconds")
+        try:
+            overlap = float(raw) if raw not in (None, "") else self._SYNC_OVERLAP_DEFAULT
+        except (TypeError, ValueError):
+            overlap = self._SYNC_OVERLAP_DEFAULT
+        if overlap <= 0:
+            return self._now_iso()
+        now = datetime.now(timezone.utc)
+        shifted = now.timestamp() - overlap
+        return datetime.fromtimestamp(shifted, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
     def upsert(self, task: dict) -> None:
         """Create or update the task on the remote service."""
         raise NotImplementedError(
@@ -1462,7 +1494,7 @@ class JiraDriver(Driver):
                     f'ORDER BY updated ASC')
             issues = self._paginate(jql=jql)
         tasks = [self.normalize(x) for x in issues]
-        return tasks, [], self._now_iso()
+        return tasks, [], self._since_with_overlap()
 
     def _paginate(self, jql: str) -> list[dict]:
         """Paginate over Jira issues.
@@ -1758,7 +1790,7 @@ class VikunjaDriver(Driver):
             filter_expr = f"updated > '{since}'"
         rows = self._paginate(filter_expr=filter_expr)
         tasks = [self.normalize(x) for x in rows]
-        return tasks, [], self._now_iso()
+        return tasks, [], self._since_with_overlap()
 
     def _paginate(self, filter_expr: str | None) -> list[dict]:
         """Vikunja's tokens are scope-limited. `/api/v1/tasks/all` needs the
@@ -2415,7 +2447,7 @@ class NotionDriver(Driver):
             # `git fetch` hangs.
             if not cursor:
                 break
-        return changed, deleted_ids, self._now_iso()
+        return changed, deleted_ids, self._since_with_overlap()
 
     # ---- Push ----
     _NOTION_BASE = "https://api.notion.com/v1"

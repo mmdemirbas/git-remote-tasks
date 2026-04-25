@@ -157,6 +157,7 @@ Per-remote (`tasks-remote.<name>.*`):
 | `databaseTitle` | notion        | Optional friendly category name.           |
 | `httpTimeout`   | all           | Per-request timeout in seconds (default 30). |
 | `pageSize`      | jira, vikunja | Fetch page size (Jira 100/max 100, Vikunja 100/max 250). |
+| `syncOverlapSeconds` | jira, vikunja, notion | Subtract this many seconds from the persisted `since` token so events that landed mid-fetch are not missed on the next run. Default 5. Set to 0 to opt out. |
 
 Run `python git_remote_tasks.py check <remote>` to validate required
 keys without touching the network. Secret-like keys are redacted in
