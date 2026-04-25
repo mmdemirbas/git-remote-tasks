@@ -3092,14 +3092,15 @@ class TestProtocolExport(unittest.TestCase):
         # "invalid literal for int()" when the parser reads a URL value
         # as a 'data N' header. _BinaryStdinReader must route everything
         # through the binary layer.
-        task = full_task(id="jira-X")
-        body = grt.YAMLSerializer().serialize(task).encode("utf-8")
+        body_x = grt.YAMLSerializer().serialize(full_task(id="jira-X")).encode("utf-8")
+        body_y = grt.YAMLSerializer().serialize(full_task(id="jira-Y")).encode("utf-8")
         # Build a byte stream with multiple blobs so readline's internal
         # buffer would definitely over-read if we went through TextIOWrapper.
+        # Per blob, the YAML id must match the path basename (R-01).
         stream = (
             b"export\n"
-            b"blob\nmark :1\ndata " + str(len(body)).encode() + b"\n" + body + b"\n"
-            b"blob\nmark :2\ndata " + str(len(body)).encode() + b"\n" + body + b"\n"
+            b"blob\nmark :1\ndata " + str(len(body_x)).encode() + b"\n" + body_x + b"\n"
+            b"blob\nmark :2\ndata " + str(len(body_y)).encode() + b"\n" + body_y + b"\n"
             b"commit refs/heads/main\n"
             b"committer g <g@g> 0 +0000\ndata 1\nx\n"
             b"M 100644 :1 tasks/jira-X.yaml\n"
@@ -3687,6 +3688,189 @@ class TestReadBlockScalarEof(unittest.TestCase):
         text = "description: |\n  a\n  b\n\n\n"
         p = grt.YAMLSerializer()._parse(text)
         self.assertEqual(p["description"], "a\nb")
+
+
+# ============================================================================
+# R-01: filename / task["id"] mismatch on push
+# ============================================================================
+
+class TestR01HandleModifyIdPathMismatch(unittest.TestCase):
+    """R-01: editing tasks/jira-A.yaml to set `id: jira-B` must not PATCH B."""
+
+    def _setup(self, content_id, path_id):
+        ser = grt.YAMLSerializer()
+        body = ser.serialize({"id": content_id, "title": "t",
+                               "source": "jira"}).encode()
+        driver = FakeDriver()
+        h = grt.ProtocolHandler("fake", "fake://x", driver, ser,
+                                 stdin=io.StringIO(),
+                                 stdout=FlushTrackingStringIO(),
+                                 stderr=io.StringIO())
+        h._handle_modify(f"M 100644 :1 tasks/{path_id}.yaml",
+                          {":1": body}, "refs/heads/main")
+        return driver, h
+
+    def test_mismatched_content_id_blocks_push(self):
+        driver, h = self._setup(content_id="jira-OTHER", path_id="jira-FILEID")
+        self.assertEqual(driver.upserted, [])
+        self.assertIn("refs/heads/main", h.export_errors)
+        self.assertIn("id/path mismatch", h.export_errors["refs/heads/main"])
+
+    def test_matching_content_id_passes_through(self):
+        driver, h = self._setup(content_id="jira-FILEID", path_id="jira-FILEID")
+        self.assertEqual(len(driver.upserted), 1)
+        self.assertEqual(driver.upserted[0]["id"], "jira-FILEID")
+        self.assertEqual(h.export_errors, {})
+
+    def test_empty_content_id_canonicalized_to_filename(self):
+        # A hand-edited file may omit `id:` entirely; the helper falls back
+        # to the filename so the operator's intent still drives the push.
+        driver, h = self._setup(content_id="", path_id="jira-FILEID")
+        self.assertEqual(len(driver.upserted), 1)
+        self.assertEqual(driver.upserted[0]["id"], "jira-FILEID")
+        self.assertEqual(h.export_errors, {})
+
+
+# ============================================================================
+# R-02: Org body line starting with `*` was dropped
+# ============================================================================
+
+class TestR02OrgBodyLeadingStar(unittest.TestCase):
+    def test_body_with_bullet_line_preserved(self):
+        ser = grt.OrgSerializer()
+        task = grt.empty_task()
+        task["id"] = "x"
+        task["title"] = "t"
+        task["description"] = "* not a headline\n* still body"
+        out = ser.serialize(task)
+        back = ser.deserialize(out)
+        self.assertEqual(back["description"], task["description"])
+
+    def test_column_zero_star_still_breaks_parse(self):
+        # A real second headline at column zero MUST still terminate the
+        # first task's parse — otherwise multiple-task org files would leak
+        # content across boundaries.
+        ser = grt.OrgSerializer()
+        text = (
+            "* TODO First\n"
+            "  :PROPERTIES:\n"
+            "  :ID: a\n"
+            "  :END:\n"
+            "* TODO Second\n"
+            "  :PROPERTIES:\n"
+            "  :ID: b\n"
+            "  :END:\n"
+        )
+        task = ser.deserialize(text)
+        self.assertEqual(task["id"], "a")
+        self.assertEqual(task["title"], "First")
+
+
+# ============================================================================
+# R-03: Org tags with commas are preserved
+# ============================================================================
+
+class TestR03OrgTagCommaCsv(unittest.TestCase):
+    def test_tag_with_comma_quoted_on_emit(self):
+        ser = grt.OrgSerializer()
+        task = grt.empty_task()
+        task["id"] = "x"
+        task["title"] = "t"
+        task["tags"] = ["needs review", "a,b", "c"]
+        out = ser.serialize(task)
+        self.assertIn(':TAGS: needs review,"a,b",c', out)
+
+    def test_tag_with_comma_roundtrips(self):
+        ser = grt.OrgSerializer()
+        for tags in [
+            ["needs review", "a,b", "c"],
+            ['quote"in"tag', "plain"],
+            ["only,one,tag"],
+            ["leading-space"],
+        ]:
+            task = grt.empty_task()
+            task["id"] = "x"
+            task["title"] = "t"
+            task["tags"] = tags
+            back = ser.deserialize(ser.serialize(task))
+            self.assertEqual(back["tags"], tags, f"tags={tags!r}")
+
+    def test_legacy_unquoted_tags_still_parse(self):
+        # Files written by the pre-R-03 emitter have no quoting. Backwards
+        # compat: those still parse to one-tag-per-comma.
+        text = (
+            "* TODO t\n"
+            "  :PROPERTIES:\n"
+            "  :ID: x\n"
+            "  :TAGS: a,b,c\n"
+            "  :END:\n"
+        )
+        back = grt.OrgSerializer().deserialize(text)
+        self.assertEqual(back["tags"], ["a", "b", "c"])
+
+
+# ============================================================================
+# R-04: YAML \r in description corrupted on round-trip
+# ============================================================================
+
+class TestR04YamlControlCharsRoundtrip(unittest.TestCase):
+    def test_carriage_return_in_description(self):
+        ser = grt.YAMLSerializer()
+        task = grt.empty_task()
+        task["id"] = "x"
+        task["title"] = "t"
+        task["description"] = "line1\rline2"
+        back = ser.deserialize(ser.serialize(task))
+        self.assertEqual(back["description"], "line1\rline2")
+
+    def test_tab_in_title(self):
+        ser = grt.YAMLSerializer()
+        task = grt.empty_task()
+        task["id"] = "x"
+        task["title"] = "col1\tcol2"
+        back = ser.deserialize(ser.serialize(task))
+        self.assertEqual(back["title"], "col1\tcol2")
+
+    def test_mixed_cr_lf_tab(self):
+        ser = grt.YAMLSerializer()
+        task = grt.empty_task()
+        task["id"] = "x"
+        task["title"] = "t"
+        task["description"] = "row1\tcell\nrow2\rrest"
+        back = ser.deserialize(ser.serialize(task))
+        self.assertEqual(back["description"], task["description"])
+
+    def test_block_scalar_still_used_for_plain_lf(self):
+        # Don't regress the readability win for plain LF-only multiline.
+        ser = grt.YAMLSerializer()
+        task = grt.empty_task()
+        task["id"] = "x"
+        task["title"] = "t"
+        task["description"] = "line1\nline2\nline3"
+        out = ser.serialize(task)
+        self.assertIn("description: |\n", out)
+
+
+# ============================================================================
+# R-05: Notion infinite loop guard
+# ============================================================================
+
+class TestR05NotionPaginationGuard(unittest.TestCase):
+    def test_breaks_when_has_more_but_no_cursor(self):
+        calls = {"n": 0}
+
+        class FakeNotion(grt.NotionDriver):
+            def _http_post(self, url, body=None, headers=None):
+                calls["n"] += 1
+                if calls["n"] > 5:
+                    raise RuntimeError("would have looped")
+                return {"results": [], "has_more": True, "next_cursor": None}
+
+        drv = FakeNotion("r", "notion://x",
+                          {"databaseId": "db1", "token": "t"})
+        # Must return cleanly, not loop.
+        changed, deleted, _ = drv.fetch_all(), [], None
+        self.assertLessEqual(calls["n"], 1)
 
 
 if __name__ == "__main__":

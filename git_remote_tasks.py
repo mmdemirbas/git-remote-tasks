@@ -220,7 +220,13 @@ def _yaml_needs_quoting(s: str) -> bool:
 
 
 def _yaml_quote(s: str) -> str:
-    escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+    # Always escape control whitespace too — a stray `\r` in a value would
+    # otherwise terminate the line on parse via `splitlines()`. (R-04, R-16)
+    escaped = (s.replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("\r", "\\r")
+                .replace("\t", "\\t")
+                .replace("\n", "\\n"))
     return f'"{escaped}"'
 
 
@@ -230,13 +236,10 @@ def _yaml_scalar(value, always_quote: bool = False) -> str:
     s = str(value)
     if always_quote:
         return _yaml_quote(s)
-    if "\n" in s:
-        # Caller handles block scalars directly; this is the fallback
-        # double-quoted form where \n is a YAML escape for newline.
-        escaped = (s.replace("\\", "\\\\")
-                    .replace('"', '\\"')
-                    .replace("\n", "\\n"))
-        return f'"{escaped}"'
+    if "\n" in s or "\r" in s or "\t" in s:
+        # Block scalars can't represent CR/TAB; force the double-quoted form
+        # so the round-trip is byte-stable. (R-04, R-16)
+        return _yaml_quote(s)
     if _yaml_needs_quoting(s):
         return _yaml_quote(s)
     return s
@@ -249,7 +252,11 @@ def _yaml_emit_string(lines: list[str], key: str, value, always_quote: bool = Fa
         lines.append(f"{pad}{key}: null")
         return
     s = str(value)
-    if "\n" in s and not always_quote:
+    if not always_quote and "\n" in s and "\r" not in s and "\t" not in s:
+        # Block scalar `|` is fine for plain LF-only multiline content; CR
+        # or TAB would be eaten by `splitlines()` / leading-space dedent on
+        # parse, so those cases fall through to the double-quoted scalar
+        # below. (R-04, R-16)
         lines.append(f"{pad}{key}: |")
         for ln in s.split("\n"):
             lines.append(f"{pad}  {ln}" if ln else f"{pad}  ")
@@ -263,7 +270,14 @@ def _parse_yaml_inline_scalar(raw: str):
         return None
     if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
         body = raw[1:-1]
-        return body.replace("\\\\", "\x00").replace('\\"', '"').replace("\\n", "\n").replace("\x00", "\\")
+        # Decode escapes via a sentinel for `\\` so later passes don't treat
+        # the introduced backslash as the start of another escape sequence.
+        return (body.replace("\\\\", "\x00")
+                    .replace('\\"', '"')
+                    .replace("\\r", "\r")
+                    .replace("\\t", "\t")
+                    .replace("\\n", "\n")
+                    .replace("\x00", "\\"))
     if len(raw) >= 2 and raw[0] == "'" and raw[-1] == "'":
         return raw[1:-1].replace("''", "'")
     return raw
@@ -517,6 +531,59 @@ def _iso_to_org_timestamp(iso: str, active: bool = False) -> str:
     return f"<{body}>" if active else f"[{body}]"
 
 
+def _org_emit_tag_csv(tags: list[str]) -> str:
+    """Encode a tag list for the `:TAGS:` Org property.
+
+    Tags that contain `,` or `"` (or leading/trailing whitespace) are
+    double-quoted with `"` escaped as `\\"`. Tags without those
+    characters emit bare so files written by older versions still
+    round-trip. (R-03)
+    """
+    parts: list[str] = []
+    for raw in tags:
+        s = raw if isinstance(raw, str) else str(raw)
+        if "," in s or '"' in s or s != s.strip():
+            parts.append('"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"')
+        else:
+            parts.append(s)
+    return ",".join(parts)
+
+
+def _org_parse_tag_csv(value: str) -> list[str]:
+    """Inverse of `_org_emit_tag_csv`. Bare commas split; quoted commas don't.
+
+    Backwards compatible with the pre-R-03 emitter, which never quoted —
+    files written by older versions parse identically since every tag was
+    bare.
+    """
+    out: list[str] = []
+    cur: list[str] = []
+    in_q = False
+    esc = False
+    for ch in value:
+        if esc:
+            cur.append(ch)
+            esc = False
+            continue
+        if in_q and ch == "\\":
+            esc = True
+            continue
+        if ch == '"':
+            in_q = not in_q
+            continue
+        if ch == "," and not in_q:
+            tag = "".join(cur).strip()
+            if tag:
+                out.append(tag)
+            cur = []
+            continue
+        cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
 _ORG_TIMESTAMP_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2})"            # date
     r"(?:\s+[A-Za-z]+)?"                # optional weekday
@@ -586,7 +653,7 @@ class OrgSerializer(Serializer):
         if t["url"]:
             props.append(("URL", t["url"]))
         if t["tags"]:
-            props.append(("TAGS", ",".join(t["tags"])))
+            props.append(("TAGS", _org_emit_tag_csv(t["tags"])))
         out.append("  :PROPERTIES:")
         for k, v in props:
             # Align property keys for readability (Emacs convention).
@@ -619,7 +686,13 @@ class OrgSerializer(Serializer):
         body_lines: list[str] = []
         while i < len(lines):
             # BUG-11: a second '* ' headline terminates this task's drawers.
-            if lines[i].lstrip().startswith("*") and lines[i].lstrip() != "*":
+            # Only column-zero `*` is a real headline — body lines emitted by
+            # the serializer are always indented (`f"  {line}"`), so a body
+            # line such as `  * bullet` is part of the description, not a new
+            # task. (R-02)
+            if lines[i].startswith("* "):
+                break
+            if lines[i] == "*":
                 break
             stripped = lines[i].strip()
             if stripped == ":PROPERTIES:":
@@ -664,8 +737,9 @@ class OrgSerializer(Serializer):
         while i < len(lines) and lines[i].strip() != ":END:":
             # BUG-11: a stray '* ' headline means this drawer was never
             # closed. Abandon the drawer rather than swallowing the next
-            # task's content.
-            if lines[i].lstrip().startswith("* "):
+            # task's content. Only column-zero `*` counts so an indented
+            # `* bullet` body line doesn't false-trip. (R-02)
+            if lines[i].startswith("* "):
                 t["category"] = cat
                 return i
             m = re.match(r"^\s*:([A-Z_]+):\s*(.*)$", lines[i])
@@ -690,7 +764,7 @@ class OrgSerializer(Serializer):
                 elif key == "URL":
                     t["url"] = value
                 elif key == "TAGS":
-                    t["tags"] = [x.strip() for x in value.split(",") if x.strip()]
+                    t["tags"] = _org_parse_tag_csv(value)
             i += 1
         t["category"] = cat
         return i + 1 if i < len(lines) else i
@@ -2286,6 +2360,14 @@ class NotionDriver(Driver):
             if not data.get("has_more"):
                 break
             cursor = data.get("next_cursor")
+            # R-05: defensive break. Notion's docs say `has_more=True` always
+            # comes with a `next_cursor`, but during eventual-consistency
+            # windows we have observed `next_cursor=None` paired with
+            # `has_more=True`. Without this guard the loop re-issues the same
+            # page indefinitely (start_cursor=None == "first page") and
+            # `git fetch` hangs.
+            if not cursor:
+                break
         return changed, deleted_ids, self._now_iso()
 
     # ---- Push ----
@@ -2988,6 +3070,24 @@ class ProtocolHandler:
             return
         try:
             task = serializer.deserialize(content.decode("utf-8"))
+            content_id = task.get("id") or ""
+            if content_id and content_id != task_id_from_path:
+                # The filename is the operator's intent. A stale or copy-pasted
+                # file with a foreign `id:` field would otherwise PATCH the
+                # wrong upstream issue silently.
+                self._log(
+                    f"refusing push: file {path!r} has content id "
+                    f"{content_id!r} (expected {task_id_from_path!r})"
+                )
+                self._record_export_error(
+                    current_ref,
+                    f"id/path mismatch for {path}: content id is "
+                    f"{content_id!r}, expected {task_id_from_path!r}",
+                )
+                return
+            # Canonicalize so the driver always operates on the filename id,
+            # even when the file omits `id:` entirely.
+            task["id"] = task_id_from_path
             self.driver.upsert(task)
         except NotImplementedError as exc:
             self._log(f"upsert not implemented: {exc}")
