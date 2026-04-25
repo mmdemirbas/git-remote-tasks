@@ -98,9 +98,17 @@ ones, and this ordering is load-bearing for the test suite:
   driver-specific `*PushError` for any id whose prefix matches a
   different scheme. Each `upsert` calls `_native_id` BEFORE any
   network IO so a refused push is synchronous.
+- **Filename is authoritative for task identity.** `_handle_modify`
+  rejects content/filename id mismatches and canonicalizes the id
+  to the filename when content omits it. Trusting `task["id"]` would
+  let a stale file silently overwrite an unrelated issue.
+- **Idempotent deletes.** All four drivers treat 404 / 410 on delete
+  as soft success — the local tree already removed the file; failing
+  here is hostile when the upstream was deleted by someone else.
 - **Path-traversal guards at every trust boundary.** `is_safe_task_id`
   + `_is_safe_tasks_path` must run before any `tasks/<id>.<ext>` write
-  or before a `D tasks/<...>` directive is honored.
+  or before a `D tasks/<...>` directive is honored. `_emit_blobs` and
+  `_write_incremental_import` both filter ids — symmetric defense.
 - **Secret redaction in `check`.** Variable names containing `token`,
   `password`, `secret`, `key`, `credential`, or `bearer` are redacted
   in stdout; an allow-list covers known-safe keys like `baseUrl`,
@@ -129,7 +137,9 @@ with `sync.mode=full` or `python git_remote_tasks.py reset <remote>`.
 
 ### Test layout
 
-- `test_git_remote_tasks.py` — default stdlib suite (324 tests).
+- `test_git_remote_tasks.py` — default stdlib suite (~400 tests).
+  Update the count loosely; do not pin it tightly enough that every
+  test addition triggers a doc edit.
 - `test_yaml_parser_fuzz.py` — hypothesis property tests (opt-in via
   `.venv`; skipped cleanly when `hypothesis` is absent).
 - `test_live_integration.py` — real-service harness. Reads credentials

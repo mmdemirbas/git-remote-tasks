@@ -61,16 +61,20 @@ for the full context.
 | `.venv` + `requirements-dev.txt` | 7963c57 | Test-time deps (hypothesis) isolated from the shipped single-file script. |
 | TEST-01    | —       | Mooted: write paths now have real tests; a separate read/write split no longer informative. |
 
-## REVIEW.md correctness audit (2026-04-25)
+## Correctness audit — 2026-04-25
+
+Full narrative in `WORKLOG.md` (entry dated 2026-04-25). Test count
+352 → 401. R-09 and R-12 are listed in `PLAN.md` §2.1 as deferred /
+documented-only.
 
 | ID    | Commit  | Result                                                                                              |
 |-------|---------|------------------------------------------------------------------------------------------------------|
 | R-01  | caf4afe | `_handle_modify` rejects content-id / filename mismatch; canonicalizes empty content_id to filename. |
-| R-02  | caf4afe | Org body `*` line at column zero only triggers headline boundary; indented body bullets preserved. |
+| R-02  | caf4afe | Org body `*` line at column zero only triggers headline boundary; indented body bullets preserved.  |
 | R-03  | caf4afe | Org `:TAGS:` quotes commas/quotes on emit; legacy unquoted files still parse.                        |
 | R-04  | caf4afe | YAML `\r` / `\t` round-trip via double-quoted form with new escape handling.                         |
 | R-05  | caf4afe | Notion `_query_pages` defensive break on falsy `next_cursor`.                                        |
-| R-06  | 2784710 | Notion push skips fields whose column is missing from the database schema.                          |
+| R-06  | 2784710 | Notion push skips fields whose column is missing from the database schema.                           |
 | R-07  | 2784710 | Tags column shape adapts: multi/single/missing each handled with one-shot warnings.                  |
 | R-08  | 2784710 | `_write_incremental_import` filters `deleted_ids` through `is_safe_task_id`.                         |
 | R-10  | 5bf53dd | Jira `_transition` failure message names the half-applied state.                                     |
@@ -81,5 +85,3 @@ for the full context.
 | R-16  | caf4afe | YAML `\t` escaped (shipped with R-04).                                                               |
 | R-17  | 9e46105 | Org weekday emission is locale-independent (hard-coded English short names).                         |
 | R-18  | 9e46105 | `cmd_init` git invocations carry `_GIT_SUBPROCESS_TIMEOUT`.                                          |
-
-Test count: 352 → 401. R-09 / R-12 deferred or documented in REVIEW.md.

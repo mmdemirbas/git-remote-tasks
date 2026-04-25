@@ -1,10 +1,10 @@
 # Work log
 
-## 2026-04-25 — REVIEW.md audit: 18 findings closed across five commits
+## 2026-04-25 — Correctness audit: 18 findings closed across five commits
 
 Self-initiated correctness audit. Read the source end-to-end, probed
-suspect paths empirically, recorded 18 findings in `REVIEW.md`, then
-implemented and tested every actionable one. Test count 352 → 401.
+suspect paths empirically, drafted 18 findings, then implemented and
+tested every actionable one. Test count 352 → 401.
 
 ### What the audit found (and what shipped)
 
@@ -97,8 +97,8 @@ landing as the same commit:
 
 ### Second-pass observations
 
-After all fixes landed, re-read the diff for new issues. Three notes
-recorded in `REVIEW.md` (S-01..S-03), none are bugs:
+After all fixes landed, re-read the diff for new issues. Three notes,
+none are bugs:
 
 - The R-01 pre-check now fires before `_native_id`'s cross-source
   error for protocol-layer pushes; the new "id/path mismatch"
@@ -121,7 +121,7 @@ recorded in `REVIEW.md` (S-01..S-03), none are bugs:
   no counter-examples on the new escape paths.
 - README §7 (config table) and §12 (troubleshooting) updated for
   every operator-visible change.
-- `DONE.md` and `REVIEW.md` carry the commit map.
+- `DONE.md` carries the per-finding commit map.
 
 ---
 

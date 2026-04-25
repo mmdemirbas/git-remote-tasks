@@ -20,11 +20,13 @@ This document survives in two halves:
 |-----------|-----|
 | Single-file runtime, stdlib-only | Trivial distribution: `scp git_remote_tasks.py` + `install`. `msal` is the sole optional runtime extra (guarded by `MSAL_AVAILABLE`). |
 | Test-time dependencies allowed under `.venv` | Isolated in `requirements-dev.txt`; never imported by the shipped script. `hypothesis` is the first example. |
-| Docs are a last-resort warning, never a fix | Anything we cannot fix today must *also* emit a runtime warning via `ProtocolHandler._warn_once`. |
+| Docs are a last-resort warning, never a fix | Anything we cannot fix today must *also* emit a runtime warning via `ProtocolHandler._warn_once` or `Driver._warn_once`. |
 | Push works for every remote, including Notion | The "pull-only" label was self-imposed; lifting it is done (FEAT-08). |
-| Incremental fetch by default | Sync state in `.git/config` under `tasks-remote.<name>.sync.*`. `sync.mode=full` is the escape hatch. |
+| Incremental fetch by default | Sync state in `.git/config` under `tasks-remote.<name>.sync.*`. `sync.mode=full` is the escape hatch. The persisted token is `now - syncOverlapSeconds` so events that landed mid-fetch are not missed. |
 | Cross-source writes are refused loudly | Editing a `jira-X.yaml` file in a Vikunja remote raises `VikunjaPushError` (etc.) rather than silently duplicating. |
-| YAML parser documents its supported subset | Fuzz tests plus adversarial corpus in `test_yaml_parser_fuzz.py` keep the subset honest. |
+| Filename is authoritative for task identity | `_handle_modify` rejects pushes where the YAML/Org `id:` field disagrees with the filename. The filename is the operator's intent; trusting `task["id"]` would let a stale or copy-pasted file overwrite an unrelated upstream issue. (R-01) |
+| Idempotent deletes | All four drivers treat 404 / 410 on delete as soft success — the local tree has already removed the file; failing because the upstream is "more deleted" is hostile. (R-11) |
+| YAML parser documents its supported subset | Fuzz tests plus adversarial corpus in `test_yaml_parser_fuzz.py` keep the subset honest. CR and TAB are in subset (forces double-quoted form on emit). |
 
 ---
 
@@ -36,6 +38,8 @@ This document survives in two halves:
 |------|-----|--------------------------------------------|------------------------------------------------------------------------------------------------------|
 | OPS-01 | DX | Jira / Vikunja upstream deletions          | Neither API has a native deletion feed. Operators flip `sync.mode full` periodically to reconcile, or run `python git_remote_tasks.py reset <remote>`. |
 | OPS-02 | DX | Concurrent push conflict handling          | If two pushes race the same item, the second overwrites the first. todo-harvest has a sqlite sync-map; we defer until there's a real user-facing collision. |
+| R-09   | DX | Vikunja `upsert` discards the response body | The planned `mirror.last_observed` design (`DESIGN-sync.md`) needs the response shape; will land with that work. |
+| R-12   | DX | Org headline `[#X]` cookie collision in titles | A title literally starting with `[#A]` is parsed as priority + title. Org-mode tradition; documenting only. |
 
 ### 2.2 Out of scope (will not do)
 
