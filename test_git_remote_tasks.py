@@ -455,6 +455,8 @@ class TestNotionSchemaAwarePush(unittest.TestCase):
         self.d = grt.NotionDriver("n", "notion://x", {
             "databaseId": "abc", "token": "t",
         })
+        self.warn_log = io.StringIO()
+        self.d._warn_stream = self.warn_log
 
     def test_status_type_emits_status_payload(self):
         schema = {"Konu": "title", "Status": "status"}
@@ -1711,12 +1713,20 @@ class TestMappingOverrides(unittest.TestCase):
         self.assertEqual(t["due_date"], "2025-01-01")
 
     def test_notion_push_respects_field_map(self):
+        # Schema MUST include the renamed column or R-06 (skip missing
+        # columns) drops the field with a warning. The test previously
+        # passed only because the old code defaulted to `select` shape and
+        # wrote a payload that Notion would 400 on at the wire — i.e. the
+        # test asserted wire-incorrect behaviour. Provide the column.
         d = grt.NotionDriver("notion", "notion://x", {
             "databaseId": "abc", "token": "t",
             "fieldMap.status": "Workflow",
         })
-        with mock.patch.object(d, "_http_get",
-                                return_value={"properties": {"Name": {"type": "title"}}}), \
+        schema = {"properties": {
+            "Name": {"type": "title"},
+            "Workflow": {"type": "select"},
+        }}
+        with mock.patch.object(d, "_http_get", return_value=schema), \
                 mock.patch.object(d, "_http_post") as post:
             d.upsert(grt.empty_task() | {"id": "", "title": "t",
                                            "status": "in_progress",
@@ -2321,6 +2331,11 @@ class TestNotionDriver(unittest.TestCase):
     def setUp(self):
         self.d = grt.NotionDriver("notion", "notion://abc",
                                   {"databaseId": "abc", "token": "tok"})
+        # Redirect schema-mismatch warnings to a buffer so the test runner
+        # output stays clean. Tests that care about the warning text inspect
+        # `self.warn_log.getvalue()` directly.
+        self.warn_log = io.StringIO()
+        self.d._warn_stream = self.warn_log
 
     def _page(self, **props) -> dict:
         return {
@@ -2399,8 +2414,14 @@ class TestNotionDriver(unittest.TestCase):
                                          "type": "database"})
 
     def test_upsert_update_existing_patches_page(self):
+        # Schema MUST advertise the columns we expect to write — R-06 skips
+        # silently-missing ones rather than emitting Notion-400 payloads.
         def fake_get(url, headers=None):
-            return {"properties": {"Name": {"type": "title"}}}
+            return {"properties": {
+                "Name": {"type": "title"},
+                "Priority": {"type": "select"},
+                "Tags": {"type": "multi_select"},
+            }}
         patches = []
         def fake_patch(url, body=None, headers=None):
             patches.append((url, body))
@@ -2414,6 +2435,8 @@ class TestNotionDriver(unittest.TestCase):
         self.assertTrue(url.endswith("/pages/abc123"))
         self.assertIn("Name", body["properties"])
         self.assertEqual(body["properties"]["Priority"]["select"]["name"], "High")
+        self.assertEqual(body["properties"]["Tags"]["multi_select"],
+                          [{"name": "a"}, {"name": "b"}])
         self.assertEqual(body["archived"], False)
 
     def test_upsert_create_posts_new_page(self):
@@ -3871,6 +3894,141 @@ class TestR05NotionPaginationGuard(unittest.TestCase):
         # Must return cleanly, not loop.
         changed, deleted, _ = drv.fetch_all(), [], None
         self.assertLessEqual(calls["n"], 1)
+
+
+# ============================================================================
+# R-06: Notion skips columns missing from the database schema
+# ============================================================================
+
+class TestR06NotionSkipsMissingColumns(unittest.TestCase):
+    def setUp(self):
+        self.d = grt.NotionDriver("n", "notion://x",
+                                   {"databaseId": "abc", "token": "t"})
+        self.warn_log = io.StringIO()
+        self.d._warn_stream = self.warn_log
+
+    def test_status_dropped_when_column_missing(self):
+        # Schema only has the title column.
+        schema = {"Name": "title"}
+        props = self.d._build_properties(
+            grt.empty_task() | {"title": "t", "status": "in_progress"},
+            "Name", schema,
+        )
+        self.assertNotIn("Status", props)
+        self.assertIn("notion-missing-col:Status", self.warn_log.getvalue())
+
+    def test_priority_dropped_when_column_missing(self):
+        schema = {"Name": "title"}
+        props = self.d._build_properties(
+            grt.empty_task() | {"title": "t", "priority": "high"},
+            "Name", schema,
+        )
+        self.assertNotIn("Priority", props)
+        self.assertIn("notion-missing-col:Priority", self.warn_log.getvalue())
+
+    def test_due_date_dropped_when_column_wrong_type(self):
+        schema = {"Name": "title", "Due": "rich_text"}
+        props = self.d._build_properties(
+            grt.empty_task() | {"title": "t", "due_date": "2025-01-01"},
+            "Name", schema,
+        )
+        self.assertNotIn("Due", props)
+        self.assertIn("notion-due-shape:Due", self.warn_log.getvalue())
+
+    def test_description_dropped_when_column_wrong_type(self):
+        schema = {"Name": "title", "Description": "select"}
+        props = self.d._build_properties(
+            grt.empty_task() | {"title": "t", "description": "hi"},
+            "Name", schema,
+        )
+        self.assertNotIn("Description", props)
+        self.assertIn("notion-desc-shape:Description",
+                       self.warn_log.getvalue())
+
+    def test_warning_emitted_only_once_per_code(self):
+        # Two pushes of the same shape error: only one warning.
+        schema = {"Name": "title"}
+        for _ in range(3):
+            self.d._build_properties(
+                grt.empty_task() | {"title": "t", "status": "todo"},
+                "Name", schema,
+            )
+        self.assertEqual(self.warn_log.getvalue().count(
+            "notion-missing-col:Status"), 1)
+
+
+# ============================================================================
+# R-07: Notion adapts to tags column shape, never silently drops
+# ============================================================================
+
+class TestR07NotionTagsColumnShape(unittest.TestCase):
+    def setUp(self):
+        self.d = grt.NotionDriver("n", "notion://x",
+                                   {"databaseId": "abc", "token": "t"})
+        self.warn_log = io.StringIO()
+        self.d._warn_stream = self.warn_log
+
+    def test_multi_select_writes_full_list(self):
+        schema = {"Name": "title", "Tags": "multi_select"}
+        props = self.d._build_properties(
+            grt.empty_task() | {"title": "t", "tags": ["a", "b", "c"]},
+            "Name", schema,
+        )
+        self.assertEqual(props["Tags"]["multi_select"],
+                          [{"name": "a"}, {"name": "b"}, {"name": "c"}])
+
+    def test_select_writes_first_tag_with_warning(self):
+        schema = {"Name": "title", "Tags": "select"}
+        props = self.d._build_properties(
+            grt.empty_task() | {"title": "t", "tags": ["a", "b"]},
+            "Name", schema,
+        )
+        self.assertEqual(props["Tags"], {"select": {"name": "a"}})
+        self.assertIn("notion-tags-shape:Tags", self.warn_log.getvalue())
+
+    def test_missing_column_drops_with_warning(self):
+        schema = {"Name": "title"}
+        props = self.d._build_properties(
+            grt.empty_task() | {"title": "t", "tags": ["a"]},
+            "Name", schema,
+        )
+        self.assertNotIn("Tags", props)
+        self.assertIn("notion-tags-shape:Tags", self.warn_log.getvalue())
+
+
+# ============================================================================
+# R-08: deleted_ids safety check before emitting D directives
+# ============================================================================
+
+class TestR08DeletedIdsSafetyCheck(unittest.TestCase):
+    def test_unsafe_deleted_id_is_skipped(self):
+        # A driver returning a malicious id must not produce
+        # `D tasks/../etc/passwd.yaml`.
+        h = make_handler()
+        # Bypass _previous_tip git lookup.
+        h._previous_tip = lambda: "abc123"
+        h._record_pending_since = lambda *a, **kw: None
+        h._write_incremental_import(
+            changed=[], deleted_ids=["../etc/passwd", "jira-OK"],
+            parent="abc123",
+        )
+        out = h.stdout.getvalue()
+        self.assertNotIn("D tasks/../etc/passwd", out)
+        self.assertIn("D tasks/jira-OK.yaml", out)
+        # And the unsafe-id warning is emitted.
+        self.assertIn("unsafe-id", h.stderr.getvalue())
+
+    def test_safe_deleted_ids_pass_through(self):
+        h = make_handler()
+        h._previous_tip = lambda: "abc123"
+        h._record_pending_since = lambda *a, **kw: None
+        h._write_incremental_import(
+            changed=[], deleted_ids=["jira-X", "vikunja-12"],
+            parent="abc123",
+        )
+        out = h.stdout.getvalue()
+        self.assertIn("D tasks/jira-X.yaml", out)
+        self.assertIn("D tasks/vikunja-12.yaml", out)
 
 
 if __name__ == "__main__":

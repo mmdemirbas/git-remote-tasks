@@ -990,6 +990,28 @@ class Driver(ABC):
         self.remote_name = remote_name
         self.url = url
         self.config = config or {}
+        # Per-run dedupe so a driver doesn't spam the same warning for every
+        # task in a batch. Reset on every Driver instantiation, which matches
+        # the helper's process lifetime.
+        self._warned_codes: set[str] = set()
+        # Test seam — tests substitute an io.StringIO so warnings can be
+        # asserted on, and so the unittest output stays clean.
+        self._warn_stream = sys.stderr
+
+    def _warn_once(self, code: str, msg: str) -> None:
+        """Emit a stderr warning at most once per run per code.
+
+        Mirrors `ProtocolHandler._warn_once`; lives on the driver because
+        push-time decisions (e.g. "tags column is select, not multi-select")
+        happen too far from the protocol handler to easily route through it.
+        """
+        if code in self._warned_codes:
+            return
+        self._warned_codes.add(code)
+        self._warn_stream.write(
+            f"git-remote-tasks: warning[{code}]: {msg}\n"
+        )
+        self._warn_stream.flush()
 
     # ---- HTTP seams (override or mock in tests) ----
     def _http_get(self, url: str, headers: dict | None = None) -> dict:
@@ -2444,12 +2466,27 @@ class NotionDriver(Driver):
         }
 
         def _select_payload(col: str, value: str) -> dict | None:
-            ptype = schema.get(col, "select")
+            # R-06: when the database has no column with this name we used
+            # to default `ptype` to "select" and emit a select payload that
+            # Notion 400s on. Skip the field instead, with a one-shot
+            # warning so the operator notices the silent drop.
+            ptype = schema.get(col)
+            if ptype is None:
+                self._warn_once(
+                    f"notion-missing-col:{col}",
+                    f"database has no column {col!r}; field skipped on push.",
+                )
+                return None
             if ptype == "status":
                 return {"status": {"name": value}}
             if ptype == "select":
                 return {"select": {"name": value}}
-            return None  # column missing or wrong type — skip rather than 400
+            self._warn_once(
+                f"notion-bad-col-shape:{col}",
+                f"column {col!r} has type {ptype!r}; expected select/status. "
+                f"Field skipped on push.",
+            )
+            return None
 
         # Prefer the inverse of the user's statusMap / priorityMap when
         # present — Notion column options are database-specific, so the
@@ -2470,18 +2507,55 @@ class NotionDriver(Driver):
             payload = _select_payload(names["priority"], pri)
             if payload:
                 props[names["priority"]] = payload
-        if task.get("tags") and schema.get(names["tags"]) == "multi_select":
-            props[names["tags"]] = {
-                "multi_select": [{"name": t} for t in task["tags"]]
-            }
-        if task.get("due_date") and schema.get(names["due_date"]) == "date":
-            props[names["due_date"]] = {"date": {"start": task["due_date"]}}
+        # R-07: tags column may be `multi_select` (the common case) or a
+        # `select` (single value) on databases that haven't been migrated.
+        # Multi-select pushes the full list; single-select pushes only the
+        # first tag and warns; missing/other types warn and drop. No silent
+        # data loss either way.
+        tags = task.get("tags") or []
+        if tags:
+            tcol = names["tags"]
+            tcol_type = schema.get(tcol)
+            if tcol_type == "multi_select":
+                props[tcol] = {
+                    "multi_select": [{"name": t} for t in tags]
+                }
+            elif tcol_type == "select":
+                self._warn_once(
+                    f"notion-tags-shape:{tcol}",
+                    f"column {tcol!r} is select (single value); pushing only "
+                    f"the first tag {tags[0]!r}.",
+                )
+                props[tcol] = {"select": {"name": tags[0]}}
+            else:
+                self._warn_once(
+                    f"notion-tags-shape:{tcol}",
+                    f"column {tcol!r} type is {tcol_type!r}; tags dropped on push.",
+                )
+        if task.get("due_date"):
+            dcol = names["due_date"]
+            if schema.get(dcol) == "date":
+                props[dcol] = {"date": {"start": task["due_date"]}}
+            else:
+                self._warn_once(
+                    f"notion-due-shape:{dcol}",
+                    f"column {dcol!r} type is {schema.get(dcol)!r}; "
+                    f"due date dropped on push.",
+                )
         desc = task.get("description")
-        if desc and schema.get(names["description"]) == "rich_text":
-            props[names["description"]] = {
-                "rich_text": [{"type": "text",
-                                "text": {"content": desc}}]
-            }
+        if desc:
+            ccol = names["description"]
+            if schema.get(ccol) == "rich_text":
+                props[ccol] = {
+                    "rich_text": [{"type": "text",
+                                    "text": {"content": desc}}]
+                }
+            else:
+                self._warn_once(
+                    f"notion-desc-shape:{ccol}",
+                    f"column {ccol!r} type is {schema.get(ccol)!r}; "
+                    f"description dropped on push.",
+                )
         return props
 
     def upsert(self, task: dict) -> None:
@@ -2851,6 +2925,18 @@ class ProtocolHandler:
         for mark, _body, path in blobs:
             self._write(f"M 100644 :{mark} {path}\n")
         for tid in deleted_ids:
+            # R-08: symmetric defense-in-depth with `_emit_blobs`. A driver
+            # bug or hostile upstream id could otherwise produce
+            # `D tasks/../etc/passwd.yaml`. fast-import accepts D for
+            # missing paths as a no-op — refusing here keeps the audit
+            # trail honest.
+            if not is_safe_task_id(tid):
+                self._warn_once(
+                    "unsafe-id",
+                    f"skipping delete of task with unsafe id {tid!r}: "
+                    f"must match [A-Za-z0-9][A-Za-z0-9._=-]* (≤255 chars).",
+                )
+                continue
             self._write(f"D tasks/{tid}.{ext}\n")
         self._write("\n")
         self._write("done\n")
