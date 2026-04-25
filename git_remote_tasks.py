@@ -499,6 +499,12 @@ ORG_STATUS_KEYWORDS = set(ORG_TO_STATUS.keys())
 PRIORITY_TO_ORG = {"critical": "A", "high": "B", "medium": "C", "low": "D"}
 ORG_TO_PRIORITY = {v: k for k, v in PRIORITY_TO_ORG.items()}
 
+# R-17: hard-coded English short weekday names. `dt.strftime("%a")` returns
+# the locale's abbreviation, so the same task serializes differently on a
+# `de_DE` vs. `en_US` machine — that's a phantom diff after a no-op fetch.
+# Org-mode's parser accepts any letters here, so locking to English is safe.
+_ORG_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
 
 def _iso_to_org_timestamp(iso: str, active: bool = False) -> str:
     """Convert an ISO8601 string to an org timestamp; returns [...] or <...>.
@@ -513,8 +519,10 @@ def _iso_to_org_timestamp(iso: str, active: bool = False) -> str:
     try:
         if "T" in s:
             dt = datetime.fromisoformat(s)
+            wday = _ORG_WEEKDAYS[dt.weekday()]
             if dt.tzinfo is None:
-                body = dt.strftime("%Y-%m-%d %a %H:%M")
+                body = (dt.strftime("%Y-%m-%d") + f" {wday} "
+                        + dt.strftime("%H:%M"))
             else:
                 offset = dt.utcoffset()
                 total = int(offset.total_seconds()) if offset is not None else 0
@@ -522,10 +530,12 @@ def _iso_to_org_timestamp(iso: str, active: bool = False) -> str:
                 total = abs(total)
                 hh, mm = divmod(total // 60, 60)
                 offset_str = "Z" if total == 0 else f"{sign}{hh:02d}{mm:02d}"
-                body = dt.strftime("%Y-%m-%d %a %H:%M") + " " + offset_str
+                body = (dt.strftime("%Y-%m-%d") + f" {wday} "
+                        + dt.strftime("%H:%M") + " " + offset_str)
         else:
             dt = datetime.fromisoformat(s)
-            body = dt.strftime("%Y-%m-%d %a")
+            wday = _ORG_WEEKDAYS[dt.weekday()]
+            body = dt.strftime("%Y-%m-%d") + f" {wday}"
     except ValueError:
         body = iso
     return f"<{body}>" if active else f"[{body}]"
@@ -1131,20 +1141,72 @@ class Driver(ABC):
         import time
         time.sleep(seconds)
 
-    @staticmethod
-    def _redact_http_error(exc: urllib.error.HTTPError,
-                            url: str) -> urllib.error.HTTPError:
-        """Return an HTTPError whose string form omits auth and bodies.
+    # R-15: read up to this many bytes of an error body before redacting.
+    # Enough for typical service errors (Jira `errorMessages`, Notion
+    # `message`, Vikunja `message`) without flooding stderr on a giant
+    # HTML 500 page.
+    _ERROR_BODY_MAX_BYTES = 1024
 
-        The default HTTPError repr includes `hdrs` and `msg`; some services
-        echo parts of the request (including bearer tokens) in their 4xx
-        payloads. Keep only the status code and a trimmed URL.
+    # Auth-token-shaped substrings to redact from the body before logging.
+    # Each regex pairs a structural keep-as-is prefix (group 1, plus optional
+    # group 2) with a sensitive value to replace.
+    _ERROR_BODY_REDACTIONS = (
+        # Authorization: Bearer xxx  /  Authorization: Basic xxx
+        (re.compile(r"(?i)(Authorization\s*:\s*(?:Bearer|Basic)\s+)\S+"),
+         r"\1<redacted>"),
+        # ?token=...   &access_token=...   etc., URL-encoded fragments
+        (re.compile(r"(?i)([?&](?:token|api[_-]?token|access[_-]?token|"
+                     r"key|password|secret)=)[^&\s\"']+"),
+         r"\1<redacted>"),
+        # JSON: "access_token":"...", "password":"...", etc.
+        (re.compile(r"(?i)(\"(?:access_token|refresh_token|api_token|token|"
+                     r"password|secret)\"\s*:\s*\")[^\"]+(\")"),
+         r"\1<redacted>\2"),
+    )
+
+    @classmethod
+    def _redact_error_body(cls, body: str) -> str:
+        out = body
+        for rx, repl in cls._ERROR_BODY_REDACTIONS:
+            out = rx.sub(repl, out)
+        return out
+
+    @classmethod
+    def _redact_http_error(cls, exc: urllib.error.HTTPError,
+                            url: str) -> urllib.error.HTTPError:
+        """Return an HTTPError whose string form omits auth but keeps a
+        short, redacted body for operator diagnosis. (R-15)
+
+        Reads up to `_ERROR_BODY_MAX_BYTES` from the response, runs auth-
+        token redactions, then appends to the message. Service error bodies
+        (Jira `errorMessages`, Notion `message`, Vikunja `message`) often
+        carry the actual reason — losing them entirely made debugging hard.
         """
         safe_url = url.split("?", 1)[0]
+        body_excerpt = ""
+        try:
+            fp = getattr(exc, "fp", None)
+            if fp is not None:
+                raw = fp.read(cls._ERROR_BODY_MAX_BYTES + 1)
+                if raw:
+                    if isinstance(raw, bytes):
+                        text = raw.decode("utf-8", errors="replace")
+                    else:
+                        text = str(raw)
+                    truncated = len(text) > cls._ERROR_BODY_MAX_BYTES
+                    text = text[:cls._ERROR_BODY_MAX_BYTES]
+                    text = cls._redact_error_body(text)
+                    # Collapse whitespace so multi-line HTML doesn't spam.
+                    text = " ".join(text.split())
+                    body_excerpt = (": " + text +
+                                    (" …" if truncated else ""))
+        except Exception:
+            # Reading or decoding the body must never raise out of an
+            # already-failing path; swallow and fall back to the bare msg.
+            body_excerpt = ""
+        msg = f"HTTP {exc.code} from {safe_url}{body_excerpt}"
         return urllib.error.HTTPError(
-            safe_url, exc.code,
-            f"HTTP {exc.code} from {safe_url}",
-            hdrs=None, fp=None,
+            safe_url, exc.code, msg, hdrs=None, fp=None,
         )
 
     # ---- Public API ----
@@ -2040,7 +2102,13 @@ class MSTodoDriver(Driver):
         return t
 
     def fetch_all(self) -> list[dict]:
-        changed, _, _ = self._fetch_with_optional_delta(use_delta=False)
+        # R-14: use the delta endpoint even on a full snapshot so the FIRST
+        # fetch persists the deltaLink. Without this, the second fetch
+        # (which is the first incremental call) re-downloads everything to
+        # seed the link, and the operator pays for two full fetches in a
+        # row. Microsoft's docs recommend seeding incremental sync with a
+        # delta call rather than a plain GET.
+        changed, _, _ = self._fetch_with_optional_delta(use_delta=True)
         return changed
 
     def fetch_changed(
@@ -3446,10 +3514,23 @@ def cmd_init(args) -> int:
               file=sys.stderr)
         return 2
 
+    # R-18: every git invocation in cmd_init carries the same timeout the
+    # rest of the helper uses. Without it a hung git (corrupt repo, fs
+    # lock) blocks `tasks-init` indefinitely.
+    def _run_git(cmd: list[str]) -> subprocess.CompletedProcess | None:
+        try:
+            return subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=_GIT_SUBPROCESS_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"tasks-init: {' '.join(cmd)} timed out",
+                  file=sys.stderr)
+            return None
+
     if not Path(".git").is_dir():
-        rc = subprocess.run(["git", "init", "--quiet"],
-                             capture_output=True, text=True).returncode
-        if rc != 0:
+        proc = _run_git(["git", "init", "--quiet"])
+        if proc is None or proc.returncode != 0:
             print("tasks-init: git init failed", file=sys.stderr)
             return 1
 
@@ -3468,19 +3549,13 @@ def cmd_init(args) -> int:
     tasks_dir.mkdir(exist_ok=True)
     (tasks_dir / ".gitkeep").touch()
 
-    subprocess.run(["git", "add", ".gitignore", "tasks/.gitkeep"],
-                    capture_output=True, text=True)
+    _run_git(["git", "add", ".gitignore", "tasks/.gitkeep"])
     # Commit only when the index has something new — re-running init on an
     # existing repo should be a no-op, not an empty-commit factory.
-    diff = subprocess.run(
-        ["git", "diff", "--cached", "--quiet"],
-        capture_output=True, text=True,
-    )
-    if diff.returncode != 0:
-        subprocess.run(
-            ["git", "commit", "--quiet", "-m", f"tasks: init ({fmt} format)"],
-            capture_output=True, text=True,
-        )
+    diff = _run_git(["git", "diff", "--cached", "--quiet"])
+    if diff is not None and diff.returncode != 0:
+        _run_git(["git", "commit", "--quiet", "-m",
+                   f"tasks: init ({fmt} format)"])
 
     cwd = Path.cwd()
     print(f"\nRepo initialized with task format: {fmt}  (in {cwd})\n")

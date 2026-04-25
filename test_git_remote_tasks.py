@@ -4221,5 +4221,169 @@ class TestR08DeletedIdsSafetyCheck(unittest.TestCase):
         self.assertIn("D tasks/vikunja-12.yaml", out)
 
 
+# ============================================================================
+# R-14: MS Todo seeds delta link on fetch_all (avoids two full fetches)
+# ============================================================================
+
+class TestR14MstodoFetchAllSeedsDelta(unittest.TestCase):
+    def test_fetch_all_uses_delta_endpoint_and_persists_link(self):
+        captured_urls = []
+        persisted = {}
+
+        class FakeMsTodo(grt.MSTodoDriver):
+            def _http_get(self, url, headers=None):
+                captured_urls.append(url)
+                if url.endswith("/me/todo/lists"):
+                    return {"value": [{"id": "L1", "displayName": "Inbox"}]}
+                # delta endpoint or plain tasks endpoint, both return tasks
+                return {
+                    "value": [{"id": "T1", "title": "one"}],
+                    "@odata.deltaLink": "https://example.com/delta-cursor",
+                }
+
+            def _persist_delta_link(self, key, value):
+                persisted[key] = value
+                self.config[key] = value
+
+        d = FakeMsTodo("m", "mstodo://x", {"accessToken": "tok"})
+        d.fetch_all()
+        # Delta endpoint must have been the second URL hit (after the lists
+        # listing).
+        delta_calls = [u for u in captured_urls if "/tasks/delta" in u]
+        self.assertEqual(len(delta_calls), 1)
+        # Link is persisted so the next incremental call uses it.
+        self.assertEqual(len(persisted), 1)
+        link_key = next(iter(persisted))
+        self.assertTrue(link_key.startswith("sync.deltaLink-"))
+
+
+# ============================================================================
+# R-15: HTTP error body retained (with auth redaction)
+# ============================================================================
+
+class TestR15HttpErrorBodyRedaction(unittest.TestCase):
+    def _make_http_error(self, code, body_bytes):
+        # urllib.error.HTTPError keeps `fp` for body access; emulate.
+        return urllib.error.HTTPError(
+            "https://api.example.com/v1/issue?token=secret",
+            code, "boom", hdrs=None, fp=io.BytesIO(body_bytes),
+        )
+
+    def test_body_appended_to_message(self):
+        d = grt.JiraDriver("jira", "https://x", {})
+        exc = self._make_http_error(
+            400, b'{"errorMessages":["Field cannot be empty"]}',
+        )
+        redacted = d._redact_http_error(exc, exc.url)
+        self.assertIn("HTTP 400", str(redacted))
+        self.assertIn("Field cannot be empty", str(redacted))
+        # Original URL had `?token=secret` — query string is stripped from
+        # the URL and the token doesn't leak.
+        self.assertNotIn("secret", str(redacted))
+        self.assertNotIn("?token", str(redacted))
+
+    def test_bearer_token_in_body_redacted(self):
+        d = grt.JiraDriver("jira", "https://x", {})
+        exc = self._make_http_error(
+            403, b'{"error":"bad token","seen":"Authorization: Bearer abc.def.ghi"}',
+        )
+        redacted = d._redact_http_error(exc, exc.url)
+        msg = str(redacted)
+        self.assertIn("HTTP 403", msg)
+        self.assertNotIn("abc.def.ghi", msg)
+        self.assertIn("<redacted>", msg)
+
+    def test_token_json_field_redacted(self):
+        d = grt.JiraDriver("jira", "https://x", {})
+        exc = self._make_http_error(
+            500, b'{"echo":{"access_token":"AABBCC","other":"keep"}}',
+        )
+        redacted = d._redact_http_error(exc, exc.url)
+        self.assertNotIn("AABBCC", str(redacted))
+        self.assertIn("keep", str(redacted))
+
+    def test_body_truncated_at_max_bytes(self):
+        d = grt.JiraDriver("jira", "https://x", {})
+        big_body = b"x" * 5000
+        exc = self._make_http_error(500, big_body)
+        redacted = d._redact_http_error(exc, exc.url)
+        msg = str(redacted)
+        # Truncation marker present.
+        self.assertIn("…", msg)
+
+    def test_unreadable_body_falls_back_to_bare_message(self):
+        d = grt.JiraDriver("jira", "https://x", {})
+        # exc with no fp: shouldn't raise, returns bare HTTP <code>.
+        exc = urllib.error.HTTPError(
+            "https://x/y", 401, "Unauthorized", hdrs=None, fp=None,
+        )
+        redacted = d._redact_http_error(exc, exc.url)
+        self.assertIn("HTTP 401", str(redacted))
+
+
+# ============================================================================
+# R-17: Org weekday is locale-independent
+# ============================================================================
+
+class TestR17OrgWeekdayLocaleIndependent(unittest.TestCase):
+    def test_known_dates_emit_english_weekdays(self):
+        # 2024-01-15 is a Monday.
+        self.assertIn("Mon", grt._iso_to_org_timestamp("2024-01-15"))
+        # 2024-01-21 is a Sunday.
+        self.assertIn("Sun", grt._iso_to_org_timestamp("2024-01-21"))
+        # 2024-01-15T10:30:00Z is a Monday.
+        self.assertIn("Mon",
+                       grt._iso_to_org_timestamp("2024-01-15T10:30:00Z"))
+
+    def test_no_strftime_a_dependence(self):
+        # A non-English locale would change strftime("%a"). Set LC_ALL to
+        # something that would change locale-dependent output, then verify
+        # we still emit "Mon".
+        try:
+            import locale
+            for cand in ("de_DE.UTF-8", "fr_FR.UTF-8", "tr_TR.UTF-8"):
+                try:
+                    locale.setlocale(locale.LC_ALL, cand)
+                    break
+                except locale.Error:
+                    continue
+            else:
+                self.skipTest("no non-English locale available on this host")
+            self.assertIn("Mon",
+                           grt._iso_to_org_timestamp("2024-01-15T10:30:00Z"))
+        finally:
+            try:
+                locale.setlocale(locale.LC_ALL, "C")
+            except Exception:
+                pass
+
+
+# ============================================================================
+# R-18: cmd_init subprocess timeouts
+# ============================================================================
+
+class TestR18CmdInitTimeouts(unittest.TestCase):
+    def test_init_handles_git_init_timeout_cleanly(self):
+        # Simulate a hung git init via TimeoutExpired.
+        with tempfile.TemporaryDirectory() as td:
+            cwd0 = os.getcwd()
+            os.chdir(td)
+            try:
+                def fake_run(cmd, **kw):
+                    if cmd[:2] == ["git", "init"]:
+                        raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+                with mock.patch("git_remote_tasks.subprocess.run",
+                                  side_effect=fake_run):
+                    args = mock.MagicMock()
+                    args.format = "yaml"
+                    args.path = None
+                    args._input_fn = lambda *a, **kw: "yaml"
+                    rc = grt.cmd_init(args)
+                    self.assertEqual(rc, 1)
+            finally:
+                os.chdir(cwd0)
+
+
 if __name__ == "__main__":
     unittest.main()
