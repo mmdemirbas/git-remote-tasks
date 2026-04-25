@@ -1638,8 +1638,12 @@ class JiraDriver(Driver):
                 return
         # Transition not offered for this issue's workflow — not an error,
         # but worth noting in the helper log so the operator can diagnose.
+        # R-10: name the half-applied state explicitly so the failure is
+        # actionable (the field PUT already landed; only the workflow move
+        # is missing).
         raise JiraPushError(
-            f"no Jira transition to {target_name!r} available for {key}"
+            f"fields updated, but no Jira transition to {target_name!r} "
+            f"is available for {key} on its current workflow"
         )
 
     def delete(self, task_id: str) -> None:
@@ -1649,8 +1653,17 @@ class JiraDriver(Driver):
             raise JiraPushError(
                 f"cannot delete {task_id!r}: not a Jira-sourced id"
             )
-        self._http_delete(f"{base}/rest/api/3/issue/{native}",
-                           headers=self._auth_header())
+        try:
+            self._http_delete(f"{base}/rest/api/3/issue/{native}",
+                               headers=self._auth_header())
+        except urllib.error.HTTPError as exc:
+            # R-11: idempotent delete. The local tree has already removed
+            # the file; failing here is hostile when the issue was deleted
+            # upstream by someone else (or never existed). 404 / 410 are
+            # both "gone" outcomes — accept them as success.
+            if exc.code in (404, 410):
+                return
+            raise
 
 
 # ---------- Vikunja ---------------------------------------------------------
@@ -1835,8 +1848,14 @@ class VikunjaDriver(Driver):
             raise VikunjaPushError(
                 f"cannot delete {task_id!r}: not a Vikunja-sourced id"
             )
-        self._http_delete(f"{base}/api/v1/tasks/{native}",
-                           headers=self._auth_header())
+        try:
+            self._http_delete(f"{base}/api/v1/tasks/{native}",
+                               headers=self._auth_header())
+        except urllib.error.HTTPError as exc:
+            # R-11: idempotent delete — see JiraDriver.delete.
+            if exc.code in (404, 410):
+                return
+            raise
 
 
 # ---------- MS Todo ---------------------------------------------------------
@@ -2185,10 +2204,16 @@ class MSTodoDriver(Driver):
         headers = self._auth_header()
         lid = urllib.parse.quote(list_id, safe="")
         tid = urllib.parse.quote(native, safe="")
-        self._http_delete(
-            f"{self._GRAPH_BASE}/me/todo/lists/{lid}/tasks/{tid}",
-            headers=headers,
-        )
+        try:
+            self._http_delete(
+                f"{self._GRAPH_BASE}/me/todo/lists/{lid}/tasks/{tid}",
+                headers=headers,
+            )
+        except urllib.error.HTTPError as exc:
+            # R-11: idempotent delete — see JiraDriver.delete.
+            if exc.code in (404, 410):
+                return
+            raise
 
 
 # ---------- Notion ----------------------------------------------------------
@@ -2604,11 +2629,20 @@ class NotionDriver(Driver):
         headers = self._auth_header()
         headers["Content-Type"] = "application/json"
         pid = urllib.parse.quote(native, safe="")
-        self._http_patch(
-            f"{self._NOTION_BASE}/pages/{pid}",
-            body={"archived": True},
-            headers=headers,
-        )
+        try:
+            self._http_patch(
+                f"{self._NOTION_BASE}/pages/{pid}",
+                body={"archived": True},
+                headers=headers,
+            )
+        except urllib.error.HTTPError as exc:
+            # R-11: idempotent delete — see JiraDriver.delete. Notion also
+            # uses 400 with a "validation_error" body for already-archived
+            # pages on some endpoints; we keep the soft-success limited to
+            # 404 / 410 so genuine schema-mismatch errors still surface.
+            if exc.code in (404, 410):
+                return
+            raise
 
 
 SCHEMES: dict[str, type[Driver]] = {

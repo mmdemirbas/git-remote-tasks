@@ -4000,6 +4000,102 @@ class TestR07NotionTagsColumnShape(unittest.TestCase):
 # R-08: deleted_ids safety check before emitting D directives
 # ============================================================================
 
+# ============================================================================
+# R-10 / R-11: Jira transition message, idempotent delete on 404 / 410
+# ============================================================================
+
+class TestR10JiraTransitionFailureMessage(unittest.TestCase):
+    def test_message_names_partial_state(self):
+        d = grt.JiraDriver("jira", "https://x/y", {
+            "baseUrl": "https://x/y", "email": "a@b.c", "apiToken": "t",
+        })
+        # No transitions offered.
+        with mock.patch.object(d, "_http_get", return_value={"transitions": []}):
+            with self.assertRaises(grt.JiraPushError) as cx:
+                d._transition("https://x/y", "PROJ-1", "in_progress",
+                               d._auth_header())
+        msg = str(cx.exception)
+        self.assertIn("fields updated", msg.lower())
+        self.assertIn("PROJ-1", msg)
+
+
+class TestR11IdempotentDelete(unittest.TestCase):
+    """A delete that the upstream service reports as 404/410 must succeed
+    locally — the file is already gone in the working tree."""
+
+    def _check_404_soft(self, driver, task_id):
+        def raise_404(*a, **kw):
+            raise urllib.error.HTTPError("http://x", 404, "Not Found", None, None)
+        with mock.patch.object(driver, "_http_delete", side_effect=raise_404), \
+                mock.patch.object(driver, "_http_patch", side_effect=raise_404):
+            driver.delete(task_id)  # must NOT raise
+
+    def _check_500_still_raises(self, driver, task_id):
+        def raise_500(*a, **kw):
+            raise urllib.error.HTTPError("http://x", 500, "boom", None, None)
+        with mock.patch.object(driver, "_http_delete", side_effect=raise_500), \
+                mock.patch.object(driver, "_http_patch", side_effect=raise_500):
+            with self.assertRaises(urllib.error.HTTPError):
+                driver.delete(task_id)
+
+    def test_jira_delete_404_is_soft_success(self):
+        d = grt.JiraDriver("jira", "https://x", {
+            "baseUrl": "https://x", "email": "a@b", "apiToken": "t",
+        })
+        self._check_404_soft(d, "jira-PROJ-1")
+
+    def test_jira_delete_410_is_soft_success(self):
+        d = grt.JiraDriver("jira", "https://x", {
+            "baseUrl": "https://x", "email": "a@b", "apiToken": "t",
+        })
+        def raise_410(*a, **kw):
+            raise urllib.error.HTTPError("http://x", 410, "Gone", None, None)
+        with mock.patch.object(d, "_http_delete", side_effect=raise_410):
+            d.delete("jira-PROJ-1")
+
+    def test_jira_delete_other_errors_propagate(self):
+        d = grt.JiraDriver("jira", "https://x", {
+            "baseUrl": "https://x", "email": "a@b", "apiToken": "t",
+        })
+        self._check_500_still_raises(d, "jira-PROJ-1")
+
+    def test_vikunja_delete_404_is_soft_success(self):
+        d = grt.VikunjaDriver("vikunja", "vikunja://x", {
+            "baseUrl": "http://localhost:3456", "apiToken": "t",
+        })
+        self._check_404_soft(d, "vikunja-1")
+
+    def test_vikunja_delete_other_errors_propagate(self):
+        d = grt.VikunjaDriver("vikunja", "vikunja://x", {
+            "baseUrl": "http://localhost:3456", "apiToken": "t",
+        })
+        self._check_500_still_raises(d, "vikunja-1")
+
+    def test_mstodo_delete_404_is_soft_success(self):
+        d = grt.MSTodoDriver("mstodo", "mstodo://x", {
+            "accessToken": "tok", "defaultListId": "L1",
+        })
+        self._check_404_soft(d, "mstodo-AAA")
+
+    def test_mstodo_delete_other_errors_propagate(self):
+        d = grt.MSTodoDriver("mstodo", "mstodo://x", {
+            "accessToken": "tok", "defaultListId": "L1",
+        })
+        self._check_500_still_raises(d, "mstodo-AAA")
+
+    def test_notion_delete_404_is_soft_success(self):
+        d = grt.NotionDriver("notion", "notion://x", {
+            "databaseId": "abc", "token": "t",
+        })
+        self._check_404_soft(d, "notion-pageid")
+
+    def test_notion_delete_other_errors_propagate(self):
+        d = grt.NotionDriver("notion", "notion://x", {
+            "databaseId": "abc", "token": "t",
+        })
+        self._check_500_still_raises(d, "notion-pageid")
+
+
 class TestR08DeletedIdsSafetyCheck(unittest.TestCase):
     def test_unsafe_deleted_id_is_skipped(self):
         # A driver returning a malicious id must not produce
