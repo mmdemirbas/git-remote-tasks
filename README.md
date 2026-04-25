@@ -497,6 +497,76 @@ Caused by a missing `Accept: application/json` header. The helper
 sets it automatically; if you see schema previews while poking Jira
 with curl, add `-H 'Accept: application/json'`.
 
+**`error: id/path mismatch for tasks/<remote>-<id>.<ext>: content id is …`**
+The file's `id:` field does not match the filename. The helper
+treats the filename as the operator's intent — pushing a file
+whose content id points at a different upstream issue would have
+silently overwritten the wrong task. Either correct the `id:`
+field or rename the file. (If you really do want to move the
+content from issue A to issue B on the same service, rename the
+file: `git mv tasks/jira-A.yaml tasks/jira-B.yaml` and edit the
+content `id:` to match.)
+
+**`warning[notion-missing-col:<name>]` / `warning[notion-tags-shape:<name>]`**
+The remote's Notion database does not have a column with the name
+the helper expected — usually because the column was renamed in
+Notion but `fieldMap.<logical>` was never set in the repo's
+`.git/config`. The helper drops the affected field on push and
+keeps going. Either rename the column back, or:
+
+```bash
+git config tasks-remote.<name>.fieldMap.dueDate "Tarih"
+git config tasks-remote.<name>.fieldMap.status "Workflow"
+```
+
+For tags, `notion-tags-shape:<col>` warns when the column is a
+`select` (single value) rather than `multi_select` — the first
+tag is written, the rest are dropped. Convert the column in
+Notion's UI if you want every tag to land.
+
+**`warning[unsafe-id]: skipping … with unsafe id …`**
+A driver returned a task id that does not match
+`[A-Za-z0-9][A-Za-z0-9._=-]{0,254}` — most likely a service-side
+data-quality issue. The single task is skipped with the warning;
+the rest of the fetch / push proceeds.
+
+**`git push` reports `error <ref> upsert failed: HTTP 400 from …: <body>`**
+Since the audit, HTTP error responses surface a redacted body
+excerpt instead of the bare status code. Strings that look like
+auth tokens (`Authorization: Bearer …`, `?token=…`,
+`"access_token":"…"`-shaped JSON) are replaced with `<redacted>`,
+but any free-text the service returns alongside is preserved.
+Treat the captured excerpts as still-sensitive — the redaction is
+best-effort, not guaranteed-complete.
+
+**Incremental fetch sometimes misses a row that was edited mid-fetch**
+By default the helper subtracts a 5-second overlap from the
+persisted `since` token so events that landed during the fetch
+are re-checked on the next run. Tune via:
+
+```bash
+git config tasks-remote.<name>.syncOverlapSeconds 30   # busy projects
+git config tasks-remote.<name>.syncOverlapSeconds 0    # opt out
+```
+
+The cost is re-fetching a small recent window on every
+incremental call; on Jira / Vikunja / Notion this is typically
+faster than picking up a missed update via a forced full fetch.
+
+**`git rm tasks/<id>.<ext>` followed by push fails with HTTP 404**
+Should not happen any more — every driver treats 404 / 410 on
+delete as soft success, since the local tree has already removed
+the file. If you still see this, you're on an old copy; reinstall
+from this repo.
+
+**`git push` reports `fields updated, but no Jira transition to '…' is available for PROJ-1 …`**
+Jira applied your field edits (title, description, priority,
+labels, due date) but the workflow your project uses does not
+offer a transition to the requested status from the issue's
+current state. Either add the transition in Jira's workflow
+editor, or change the local status to one the workflow allows
+and push again.
+
 ## 13. Development
 
 ```bash

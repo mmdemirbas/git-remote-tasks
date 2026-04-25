@@ -58,10 +58,14 @@ if HYPOTHESIS_AVAILABLE:
     # Constrain text so we never feed control bytes or YAML-document markers
     # into a subset parser that does not claim to handle them. The supported
     # subset is documented on YAMLSerializer.
+    #
+    # R-04 / R-16: CR and TAB are now in subset (forces double-quoted form).
+    # We re-add them via whitelist_characters so the property tests actually
+    # exercise the new escape paths instead of skipping them.
     _SAFE_TEXT = st.text(
         alphabet=st.characters(
             blacklist_categories=("Cc", "Cs"),
-            blacklist_characters="\r",  # CRLF is out of subset
+            whitelist_characters="\r\t\n",
         ),
         min_size=0,
         max_size=80,
@@ -69,7 +73,7 @@ if HYPOTHESIS_AVAILABLE:
     _SAFE_ONELINER = st.text(
         alphabet=st.characters(
             blacklist_categories=("Cc", "Cs"),
-            blacklist_characters="\r\n",
+            whitelist_characters="\t",  # tab OK; CR/LF would break a oneliner
         ),
         min_size=0,
         max_size=60,
@@ -151,6 +155,14 @@ ADVERSARIAL_TITLES = [
     "üñîçödé 🌟",                            # high BMP + astral plane
     "weird chars: !@#$%^&*()",
     "tabs\tand spaces",
+    # R-04 / R-16: CR and TAB are now in the supported subset for
+    # double-quoted strings. The emitter switches off block-scalar form
+    # when these chars appear so the round-trip stays byte-stable.
+    "carriage\rreturn",
+    "leading\rcr",
+    "trailing cr\r",
+    "only\r",
+    "mixed\tcr\rand\ntab",
 ]
 
 ADVERSARIAL_DESCRIPTIONS = [
@@ -165,6 +177,12 @@ ADVERSARIAL_DESCRIPTIONS = [
     "  indented first line",
     "\n leading blank line then text",
     "emoji 🚀 in prose",
+    # R-04 / R-16: forces double-quoted form because block scalars can't
+    # represent CR or TAB cleanly.
+    "carriage\rreturn",
+    "tab\tinside",
+    "crlf line\r\nbreak",
+    "row1\tcell\nrow2\rrest",
 ]
 
 

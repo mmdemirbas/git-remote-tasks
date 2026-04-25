@@ -1,5 +1,130 @@
 # Work log
 
+## 2026-04-25 — REVIEW.md audit: 18 findings closed across five commits
+
+Self-initiated correctness audit. Read the source end-to-end, probed
+suspect paths empirically, recorded 18 findings in `REVIEW.md`, then
+implemented and tested every actionable one. Test count 352 → 401.
+
+### What the audit found (and what shipped)
+
+**P0 — silent data loss on round-trip (commit `caf4afe`).** Five
+distinct failure modes, all reproducible from a fresh checkout, all
+landing as the same commit:
+
+- **R-01** `_handle_modify` trusted `task["id"]` over the filename. A
+  stale or copy-pasted file with `id: jira-OTHER` would PATCH the
+  wrong upstream issue. The filename is the operator's intent; the
+  helper now rejects content/filename mismatches and canonicalizes
+  the id to the filename when content omits it.
+- **R-02** Org body line `* note` was parsed as a new headline and
+  dropped because the guard fired on `lstrip().startswith("*")`. The
+  serializer always indents body lines, so column-zero `*` is the
+  real boundary. Tightened the check.
+- **R-03** Org `:TAGS:` used `,` as a separator with no escaping; a
+  tag containing a comma got split into multiple tags on round-trip.
+  Added quoting via `"` with `\"` and `\\` escapes; legacy unquoted
+  files still parse since the new reader treats bare commas as
+  separators identically.
+- **R-04** YAML `\r` in a description silently truncated the value
+  because `splitlines()` treats CR as a line break and the emitter
+  wrote raw CR. Force the double-quoted form when CR or TAB are
+  present; decode `\r` / `\t` escapes on parse. Block scalars are
+  still used for plain LF-only multiline. R-16 (TAB-escape) shipped
+  with this since the implementations are intertwined.
+- **R-05** Notion `_query_pages` looped forever when `has_more=True`
+  came paired with `next_cursor=None` (observed during eventual-
+  consistency windows). Defensive break on falsy cursor.
+
+**P1 — push-side hardening (commits `2784710`, `5bf53dd`).**
+
+- **R-06 / R-07** `_select_payload` defaulted to `select` shape when
+  the column was missing from the database schema, producing payloads
+  Notion 400s on. Now: skip with one-shot warning. Same treatment
+  for tags (multi/single/missing each handled), due_date, and
+  description shape mismatches.
+- **R-08** `_write_incremental_import` emitted `D tasks/<id>.<ext>`
+  from `deleted_ids` without validating the id, so a buggy or hostile
+  upstream could push paths like `D tasks/../etc/passwd.yaml` into
+  the stream. fast-import accepts those silently as a no-op miss;
+  symmetric `is_safe_task_id` filter added.
+- **R-10** Jira's transition-failure message now names the half-
+  applied state ("fields updated, but no transition to … is available
+  for PROJ-1 on its current workflow") so operators know the field
+  PUT already landed.
+- **R-11** All four drivers treat 404 / 410 on delete as soft success.
+  `git rm` + push for an issue that the upstream service already
+  removed used to fail; idempotent now.
+
+**P1 — sync drift (commit `9ffac1d`).**
+
+- **R-13** `_now_iso()` was the next-since token on Jira / Vikunja /
+  Notion. Events that landed upstream during a paginated fetch had
+  `updated_date` slightly before our wall-clock read, so the next
+  call's `updated >= "<now>"` filter missed them. Added
+  `_since_with_overlap()` (default 5s) so the persisted token is
+  `now - overlap_seconds`. Configurable per remote via
+  `tasks-remote.<name>.syncOverlapSeconds`; set to 0 to opt out.
+  MS Todo unaffected (Graph delta links handle ordering server-side).
+
+**P2 — polish (commit `9e46105`).**
+
+- **R-14** `MSTodoDriver.fetch_all` now uses `/tasks/delta` so the
+  first fetch persists the deltaLink. Previously the second fetch
+  (first incremental call) re-downloaded everything to seed the
+  link — operators paid for two full fetches in a row.
+- **R-15** `_redact_http_error` stripped the response body wholesale,
+  losing useful diagnostics (Jira `errorMessages`, Notion `message`,
+  Vikunja `message`). Read up to 1KB, run targeted redactions for
+  `Authorization: Bearer/Basic`, `?token=...` query strings, and
+  JSON `"access_token":"..."`-shaped fields, then append. Whitespace
+  collapsed so HTML 500s don't flood stderr.
+- **R-17** `_iso_to_org_timestamp` used `dt.strftime("%a")` which is
+  locale-dependent — two clones in different locales emitted
+  different bytes for the same ISO timestamp. Hard-coded English
+  short weekday table.
+- **R-18** `cmd_init`'s git invocations had no timeout. A hung git
+  blocked `tasks-init` indefinitely. Wrapped in a helper that honours
+  `_GIT_SUBPROCESS_TIMEOUT`.
+
+### What I deliberately did not fix
+
+- **R-09** Vikunja `upsert` discarding the response body. The planned
+  `mirror.last_observed` design (`DESIGN-sync.md`) needs the response
+  shape and will land with that work.
+- **R-12** Org headline `[#X]` priority cookie collision. Org tradition;
+  documenting only.
+
+### Second-pass observations
+
+After all fixes landed, re-read the diff for new issues. Three notes
+recorded in `REVIEW.md` (S-01..S-03), none are bugs:
+
+- The R-01 pre-check now fires before `_native_id`'s cross-source
+  error for protocol-layer pushes; the new "id/path mismatch"
+  message is structurally clearer than the old "refusing to push X
+  to <scheme>" but loses the cross-service phrasing. Driver unit
+  tests still cover the cross-source path directly.
+- R-15 redaction is best-effort by design — `Token xyz`,
+  `X-API-Key`-style headers, and YAML-shaped credentials in bodies
+  are not caught. Treat error logs as still-sensitive.
+- MS Todo deltaLink seeding is opportunistic — if the FIRST
+  `_persist_delta_link` fails (config locked), the next process
+  re-seeds. Equivalent to the old behaviour; no regression.
+
+### Verification
+
+- `python -m unittest -q test_git_remote_tasks` → 401 / 401.
+- `.venv/bin/python -m unittest -v test_yaml_parser_fuzz` → 11 / 11.
+  Fuzz strategies relaxed so `_SAFE_TEXT` now generates `\r`, `\n`,
+  `\t` (previously blacklisted as out-of-subset). Hypothesis found
+  no counter-examples on the new escape paths.
+- README §7 (config table) and §12 (troubleshooting) updated for
+  every operator-visible change.
+- `DONE.md` and `REVIEW.md` carry the commit map.
+
+---
+
 ## 2026-04-15 — MS Todo deltaLink corruption + task-id regex + fetch feedback
 
 Three issues reported against the second round of live MS Todo fetches.
