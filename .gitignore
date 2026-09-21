@@ -19,3 +19,7 @@ __pycache__/
 # Secrets / Local config
 .env
 .env.local
+# oku docs tree: the kit symlink points at the local install; dist/ is the build
+docs/_oku
+docs/dist/
+tmp/
