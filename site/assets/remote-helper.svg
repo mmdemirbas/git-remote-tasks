@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="480" viewBox="0 0 1200 480" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="14">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#6b7280"/></marker>
+    <marker id="f" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#2563eb"/></marker>
+    <marker id="p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#16a34a"/></marker>
+    <style>
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace; font-size: 12.5px; }
+      .h { font-size: 16px; font-weight: 700; fill: #111827; }
+      .kind { font-size: 10.5px; font-weight: 700; letter-spacing: .06em; fill: #6b7280; }
+      .name { font-size: 14px; font-weight: 700; fill: #111827; }
+      .sub { font-size: 12.5px; fill: #4b5563; }
+      .cap { font-size: 12.5px; fill: #6b7280; }
+      .lbl { font-size: 12px; fill: #374151; }
+    </style>
+  </defs>
+  <rect width="1200" height="480" rx="14" fill="#ffffff" stroke="#e5e7eb"/>
+  <text x="40" y="44" class="h">A task tracker as a git remote: fetch imports tasks as files, push exports edits as API calls</text>
+
+  <!-- your repo -->
+  <g transform="translate(40,90)">
+    <rect width="300" height="300" rx="12" fill="#f9fafb" stroke="#d1d5db"/>
+    <text x="16" y="26" class="kind">YOUR REPOSITORY</text>
+    <g class="mono" transform="translate(16,52)" fill="#1f2937">
+      <text y="0">tasks/</text>
+      <text y="20">  jira-PROJ-123.yaml</text>
+      <text y="40">  jira-PROJ-124.yaml</text>
+      <text y="60">  vikunja-42.yaml</text>
+      <text y="80">  notion-a91f….yaml</text>
+    </g>
+    <g class="mono" transform="translate(16,160)" fill="#4b5563">
+      <text y="0">$ $EDITOR tasks/jira-PROJ-123.yaml</text>
+      <text y="20">$ git commit -am "bump priority"</text>
+      <text y="40">$ git push jira-work main</text>
+    </g>
+    <text x="16" y="250" class="sub">refs/remotes/jira-work/main is a real linear</text>
+    <text x="16" y="268" class="sub">history: one commit per sync, bisectable.</text>
+  </g>
+
+  <!-- helper -->
+  <g transform="translate(450,120)">
+    <rect width="300" height="240" rx="12" fill="#eff6ff" stroke="#3b82f6" stroke-width="2"/>
+    <text x="16" y="26" class="kind">GIT REMOTE HELPER</text>
+    <text x="16" y="50" class="name mono">git-remote-jira</text>
+    <text x="16" y="70" class="sub">a symlink to git_remote_tasks.py;</text>
+    <text x="16" y="88" class="sub">argv[0] picks the scheme</text>
+    <g class="mono" transform="translate(16,116)" fill="#1f2937">
+      <text y="0">git-remote-jira</text>
+      <text y="18">git-remote-vikunja</text>
+      <text y="36">git-remote-mstodo</text>
+      <text y="54">git-remote-notion</text>
+    </g>
+    <text x="16" y="200" class="sub">One Python file, standard library only.</text>
+    <text x="16" y="218" class="sub">Speaks git's helper protocol on stdin/stdout.</text>
+  </g>
+
+  <!-- service -->
+  <g transform="translate(860,120)">
+    <rect width="300" height="240" rx="12" fill="#f0fdf4" stroke="#86efac"/>
+    <text x="16" y="26" class="kind">THE TRACKER'S REST API</text>
+    <text x="16" y="50" class="name">Jira · Vikunja · Microsoft To Do · Notion</text>
+    <text x="16" y="80" class="sub">Full snapshot on the first fetch;</text>
+    <text x="16" y="98" class="sub">changed-since delta afterwards.</text>
+    <text x="16" y="126" class="sub">Push: one upsert per edited file,</text>
+    <text x="16" y="144" class="sub">one delete per removed file.</text>
+    <text x="16" y="172" class="sub">A cross-source id (jira-X pushed to</text>
+    <text x="16" y="190" class="sub">Vikunja) is refused, never duplicated.</text>
+    <text x="16" y="218" class="sub">Credentials stay in .git/config.</text>
+  </g>
+
+  <!-- arrows -->
+  <g fill="none" stroke-width="2">
+    <path stroke="#2563eb" d="M750 200 L 860 200" marker-start="url(#f)" />
+    <path stroke="#2563eb" d="M450 200 L 340 200" marker-end="url(#f)"/>
+    <path stroke="#16a34a" d="M340 280 L 450 280" marker-end="url(#p)"/>
+    <path stroke="#16a34a" d="M750 280 L 860 280" marker-end="url(#p)"/>
+  </g>
+  <text x="395" y="188" class="lbl" fill="#2563eb" text-anchor="middle">git fetch</text>
+  <text x="395" y="222" class="lbl" fill="#2563eb" text-anchor="middle">fast-import</text>
+  <text x="805" y="188" class="lbl" fill="#2563eb" text-anchor="middle">GET, paginated</text>
+  <text x="395" y="268" class="lbl" fill="#16a34a" text-anchor="middle">git push</text>
+  <text x="395" y="302" class="lbl" fill="#16a34a" text-anchor="middle">fast-export</text>
+  <text x="805" y="268" class="lbl" fill="#16a34a" text-anchor="middle">PUT / POST / DELETE</text>
+
+  <text x="40" y="430" class="cap">git spawns the helper because the remote URL's scheme (jira://, vikunja://, mstodo://, notion://) names it; the helper translates between the tracker</text>
+  <text x="40" y="448" class="cap">and git's object model. git diff, log, blame, bisect and tags then work on tasks the same way they work on code.</text>
+</svg>

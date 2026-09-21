@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>git-remote-tasks — Jira, Vikunja, Microsoft To Do and Notion as git remotes</title>
+<meta name="description" content="A git remote helper: git fetch pulls every task in as a file under tasks/; edit, commit, git push, and the tracker changes. One Python file, standard library only.">
+<meta property="og:title" content="git-remote-tasks — Jira, Vikunja, Microsoft To Do and Notion as git remotes">
+<meta property="og:description" content="A git remote helper: git fetch pulls every task in as a file under tasks/; edit, commit, git push, and the tracker changes. One Python file, standard library only.">
+<meta property="og:image" content="https://mmdemirbas.github.io/git-remote-tasks/assets/remote-helper.svg">
+<link rel="canonical" href="https://mmdemirbas.github.io/git-remote-tasks/">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ea580c'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&display=swap">
+<link rel="stylesheet" href="style.css">
+<style>
+:root { --accent: #ea580c; --accent-2: #8b5cf6; --accent-on: #ffffff; --accent-ink-on-paper: #c2410c; }
+@media (prefers-color-scheme: dark) { :root { --accent-ink-on-paper: #fdba74; } }
+</style>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="#"><span class="mark" aria-hidden="true"></span>git-remote-tasks</a>
+  <nav><a href="#how" class="">How it works</a><a href="#install" class="">Quick start</a><a href="#workflow" class="hide-sm">Workflow</a><a class="gh" href="https://github.com/mmdemirbas/git-remote-tasks" rel="noopener"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a></nav>
+</div></header>
+
+<main>
+<section class="hero"><div class="wrap">
+  <p class="eyebrow">Git remote helper · Python, standard library only · MIT</p>
+  <h1>Your task tracker, as a git remote.</h1>
+  <p class="lead">git fetch jira-work pulls every issue in as a file under tasks/. Edit one in your editor, commit, git push — and the issue changes on Jira. Vikunja, Microsoft To Do and Notion the same way. Every sync is a commit, so diff, log, blame, bisect and tags work on tasks.</p>
+  <div class="cta"><a class="btn btn-solid" href="#install">Quick start</a><a class="btn btn-quiet" href="https://github.com/mmdemirbas/git-remote-tasks" rel=noopener><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>Source on GitHub</a></div>
+  <div class="stats"><div><b>4</b><span>trackers: Jira, Vikunja, Microsoft To Do, Notion</span></div><div><b>1</b><span>Python file, no dependencies, four names by symlink</span></div><div><b>2</b><span>file formats: YAML or Org-mode, chosen at init</span></div></div>
+  <div class="visual"><figure class="hero-fig frame plain"><img src="assets/remote-helper.svg" alt="A task tracker as a git remote: fetch imports tasks as files, push exports edits as API calls" loading="eager"></figure></div>
+</div></section>
+
+<section id="why"><div class="wrap">
+  <p class="pitch">A git remote helper is any executable named <code>git-remote-&lt;scheme&gt;</code> on the PATH: git spawns it for a URL with that scheme and speaks a line protocol over stdin and stdout. <em>This one translates between each tracker's REST API and git's object model</em> — nothing else in your workflow changes.</p>
+  <div class="features" style="margin-top: clamp(1.5rem, 4vw, 2.5rem)"><div class="feature"><div class="glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="9" r="2.5"/><path d="M6 8.5v7"/><path d="M18 11.5c0 4-12 2-12 6"/></svg></div><h3>Every sync is a commit</h3><p><code>refs/remotes/&lt;remote&gt;/main</code> is a real linear history based on the previous tip. <code>git diff main jira/main</code> shows what changed upstream; <code>git log -- tasks/</code> is the audit trail; <code>git bisect</code> walks every sync.</p></div><div class="feature"><div class="glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z"/><path d="M14 2v6h6"/></svg></div><h3>YAML or Org-mode</h3><p>One format per repository, chosen at init. YAML diffs one property per line; Org gives Emacs and neovim agenda, <code>DEADLINE:</code> lines and <code>[#B]</code> priorities. Both round-trip through one schema.</p></div><div class="feature"><div class="glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg></div><h3>Incremental</h3><p>A full snapshot on the first fetch, a changed-since delta afterwards, with tombstones for deletions. The <code>since</code> token is recorded only once the tip has advanced, so an interrupted import never loses data.</p></div><div class="feature"><div class="glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></div><h3>Honest push</h3><p>One upsert per edited file, one delete per removed file. A cross-source id is refused rather than duplicated; <code>ok</code> or <code>error</code> per ref, and <code>git push</code>'s exit code reflects every failure.</p></div><div class="feature"><div class="glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div><h3>Credentials in .git/config</h3><p>Tokens live under <code>[tasks-remote "&lt;name&gt;"]</code>, never in the URL. <code>check &lt;remote&gt;</code> validates the required keys without touching the network and redacts the secret-like ones.</p></div><div class="feature"><div class="glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 8 12 3 3 8v8l9 5 9-5V8z"/><path d="M3 8l9 5 9-5"/><path d="M12 13v8"/></svg></div><h3>Nothing to install but itself</h3><p>Python 3.10+ and git 2.20+. <code>install --bin-dir</code> drops the file and the four symlinks on your PATH; <code>msal</code> is the one optional extra, for To Do's device-code login.</p></div></div>
+</div></section>
+
+<section id="how"><div class="wrap">
+  <div class="section-head"><h2>How it works</h2><p>Two directions of git's remote-helper protocol, one file answering both.</p></div>
+  <div class="how wide"><div></div><ol class="steps"><li><div><b>git fetch: capabilities, list, import</b><p>The helper decides between a full snapshot — <code>deleteall</code> and a rebuilt <code>tasks/</code> tree — and a delta: <code>M</code> for changed files, <code>D</code> for tombstones.</p></div></li><li><div><b>A fast-import stream</b><p>Written to stdout, based on the previous remote tip with <code>from &lt;sha&gt;</code>. Git builds the commit; the new <code>since</code> token is persisted only when the tip has advanced.</p></div></li><li><div><b>git push: a fast-export stream</b><p>Git writes the commits to push. Each <code>M</code> under <code>tasks/</code> is deserialised and upserted on the tracker; each <code>D</code> is deleted; anything outside <code>tasks/</code> is ignored.</p></div></li><li><div><b>ok or error, per ref</b><p>Every failure is reported by name and the exit code is non-zero if anything failed; nothing is retried behind your back.</p></div></li></ol></div>
+  
+</div></section>
+<section id="install"><div class="wrap">
+  <div class="section-head"><h2>Quick start</h2><p>Python 3.10+ and git 2.20+. Credentials go into the repository's <code>.git/config</code> with <code>git config</code>; the URL only carries the scheme.</p></div>
+  <div class="install two"><div><h3>Install and initialise</h3><pre class="code"><code>git clone https://github.com/mmdemirbas/git-remote-tasks.git ~/src/git-remote-tasks
+python ~/src/git-remote-tasks/git_remote_tasks.py install --bin-dir ~/.local/bin
+
+tasks-init --format yaml ~/work/tasks &amp;&amp; cd ~/work/tasks
+git remote add vikunja vikunja://localhost:3456
+git config tasks-remote.vikunja.scheme    vikunja
+git config tasks-remote.vikunja.baseUrl   http://localhost:3456
+git config tasks-remote.vikunja.apiToken  $(pass show vikunja/api)</code></pre><p class=note>Schemes: <code>jira://company.atlassian.net</code>, <code>vikunja://host</code>, <code>mstodo://consumers</code>, <code>notion://db-&lt;id&gt;</code>. The host part is informational.</p></div><div><h3>Fetch, edit, push</h3><pre class="code"><code>git fetch vikunja
+git merge vikunja/main --allow-unrelated-histories   <span class="c"># first time only</span>
+
+$EDITOR tasks/vikunja-42.yaml
+git add tasks/ &amp;&amp; git commit -m &quot;tasks: raise priority on 42&quot;
+git push vikunja main                                <span class="c"># updates task 42</span></code></pre><p class=note><code>python git_remote_tasks.py check vikunja</code> validates the configuration without a network call.</p></div></div>
+</div></section>
+<section id="workflow"><div class="wrap">
+  <div class="section-head"><h2>The git workflow</h2><p>Ordinary git commands, and what each means for tasks.</p></div>
+  <div class="table-wrap"><table><thead><tr><th>Git command</th><th>Effect</th></tr></thead><tbody><tr><td><code>git fetch &lt;remote&gt;</code></td><td>Pulls the remote task snapshot into <code>&lt;remote&gt;/main</code></td></tr><tr><td><code>git diff main &lt;remote&gt;/main</code></td><td>What changed upstream since the last sync</td></tr><tr><td><code>git merge &lt;remote&gt;/main</code></td><td>Materialises remote tasks into the working tree</td></tr><tr><td><code>git log -- tasks/</code></td><td>The audit trail of every sync and manual edit</td></tr><tr><td><code>git push &lt;remote&gt; main</code></td><td>Upserts edited tasks; deletes removed files</td></tr><tr><td><code>git tag release/2026-W38</code></td><td>A snapshot of task state at a moment in time</td></tr></tbody></table></div>
+</div></section><section id="file"><div class="wrap">
+  <div class="section-head"><h2>What a task looks like</h2><p><code>tasks/&lt;source&gt;-&lt;native-id&gt;.yaml</code> — or <code>.org</code> — one file per task, every field on its own line.</p></div>
+  <pre class="code"><code><span class="c"># tasks/jira-PROJ-123.yaml</span>
+id: jira-PROJ-123
+source: jira
+title: Rotate the signing key before the audit
+description: |
+  The current key expires on the 14th; the audit starts on the 7th.
+status: in_progress
+priority: high
+created_date: &quot;2026-09-02T09:14:00+00:00&quot;
+due_date: &quot;2026-10-01&quot;
+updated_date: &quot;2026-09-18T16:40:12+00:00&quot;
+tags:
+  - security
+  - q4
+category:
+  id: PROJ
+  name: Platform
+  type: project
+url: https://company.atlassian.net/browse/PROJ-123</code></pre>
+</div></section><section id="config"><div class="wrap">
+  <div class="section-head"><h2>Configuration</h2><p>Everything under <code>[tasks]</code> and <code>[tasks-remote "&lt;name&gt;"]</code> in the repository's <code>.git/config</code>. The keys that matter most; the full reference is in the README.</p></div>
+  <div class="table-wrap"><table><thead><tr><th>Key</th><th>Scheme</th><th>Meaning</th></tr></thead><tbody><tr><td><code>tasks.format</code></td><td>—</td><td><code>yaml</code> or <code>org</code>, set once at init</td></tr><tr><td><code>scheme</code></td><td>all</td><td><code>jira</code>, <code>vikunja</code>, <code>mstodo</code> or <code>notion</code></td></tr><tr><td><code>baseUrl</code>, <code>apiToken</code>, <code>email</code></td><td>jira, vikunja</td><td>Service URL and credentials; <code>email</code> for Atlassian</td></tr><tr><td><code>projectKey</code> / <code>projectId</code></td><td>jira / vikunja</td><td>Required to create new issues or tasks on push</td></tr><tr><td><code>jql</code></td><td>jira</td><td>Override the default filter</td></tr><tr><td><code>tenantId</code>, <code>clientId</code>, <code>defaultListId</code></td><td>mstodo</td><td>MSAL tenant and app; the list for create and delete</td></tr><tr><td><code>databaseId</code>, <code>token</code></td><td>notion</td><td>Target database and integration token</td></tr><tr><td><code>syncOverlapSeconds</code></td><td>jira, vikunja, notion</td><td>Subtracted from the persisted <code>since</code> so events that landed mid-fetch are not missed; default 5</td></tr></tbody></table></div>
+</div></section>
+
+<section id="more"><div class="wrap">
+  <div class="section-head"><h2>Go deeper</h2></div>
+  <div class="links"><a class="link-card" href="https://github.com/mmdemirbas/git-remote-tasks#readme" rel=noopener><b>README</b><span>The full manual: every configuration key, incremental sync state, custom mappings, setup per service, Org-mode tips and troubleshooting.</span><small>GitHub</small></a><a class="link-card" href="https://github.com/mmdemirbas/git-remote-tasks" rel=noopener><b>Source</b><span>git_remote_tasks.py and its tests — a unit suite on the standard library, a hypothesis fuzz for the YAML parser, a live integration run.</span><small>MIT licence</small></a><a class="link-card" href="https://github.com/mmdemirbas/git-remote-tasks/blob/main/CONTRIBUTING.md" rel=noopener><b>Contributing</b><span>The development loop, and GIT_REMOTE_TASKS_DEBUG=1 for a trace of every HTTP call.</span><small>CONTRIBUTING.md</small></a></div>
+</div></section>
+</main>
+
+<footer><div class="wrap">
+  <span>git-remote-tasks</span>
+  <span class="spacer"></span>
+  <a href="https://github.com/mmdemirbas/git-remote-tasks" rel="noopener">GitHub</a>
+  <a href="https://mdemirbas.com/en/projects/git-remote-tasks/" rel="noopener">Muhammed Demirbaş</a>
+  <a href="https://mdemirbas.com/" rel="noopener">Other projects</a>
+</div></footer>
+</body>
+</html>
