@@ -1,0 +1,31 @@
+#:schema ../ajans/schema/project-2.schema.json
+contract = 2
+
+[verbs]
+deploy = "Install git-remote-tasks on this machine"
+
+[operations.test]
+summary = "The stdlib unittest suite (or the tests named: test_git_remote_tasks.TestX)"
+
+[operations."test fuzz"]
+summary = "Hypothesis fuzz suite for the YAML parser (needs ./ctl setup)"
+
+[operations."test live"]
+summary = "Live end-to-end tests: create and update marked tasks on real services (GRT_LIVE_CONFIG)"
+needs = ["network"]
+effects = ["publishes"]
+
+[operations.check]
+summary = "Gate: manifest, then the stdlib suite CI runs on every push"
+
+[operations.setup]
+summary = "Create .venv with the test-only dependencies (hypothesis)"
+needs = ["network"]
+
+[operations."deploy cli"]
+summary = "Link the git-remote-<scheme> helpers into ~/.local/bin"
+target = "local:cli"
+
+[operations.uninstall]
+summary = "Remove the git-remote-<scheme> links from ~/.local/bin"
+intent = "clean"

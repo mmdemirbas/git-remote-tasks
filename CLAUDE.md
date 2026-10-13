@@ -32,6 +32,11 @@ python git_remote_tasks.py check <remote-name>
 python git_remote_tasks.py reset <remote-name>
 ```
 
+`./ctl` offers the same under the shared verbs for the ajans board
+(`ajans.toml` declares them; `./ctl --list` prints them): `test` (names pass
+through), `test fuzz`, `test live`, `check` (`./ctl --check`, then the stdlib
+suite), `setup` (the `.venv`), `deploy cli` and `uninstall`.
+
 Tests use **unittest + unittest.mock only** — this is an explicit override of
 the global "prefer pytest" rule. Do not convert tests to pytest.
 
